@@ -57,6 +57,10 @@ dataset/<run_id>/                     # run_id = 수집 시각 (YYYYMMDD_HHMMSS)
     track/
         racing_line.parquet / .csv    # 레이싱 라인 + 트랙 폭(맵) + AI 속도 프로파일
         track.json                    # 트랙 이름, 점 개수, 식별 정확도
+    processed/                        # E2E/IL 학습용 후처리 피처 (선별·가공)
+        ego_features.parquet / .csv       # 선별된 자차 운동상태 + 라벨
+        opponent/opp_<id>_features.parquet/.csv  # 상대차별 절대좌표+ego-frame+속도 (프레임 정렬)
+        track_features.parquet / .csv     # 레이싱 라인 대비 오프셋/heading/곡률/경계거리
     ── raw 소스(백업, 재정렬용) ──
     image_index.parquet               # frame ↔ t ↔ image_path
     telemetry_raw.parquet             # tick별 ego 전체 + steer/throttle/brake (고주파 원본)
@@ -181,6 +185,48 @@ state(약 90필드)를 통째로 저장한 것 + 정답 라벨(steer/throttle/br
 
 ---
 
+## 후처리 피처 (`processed/`)
+
+raw(ego_state/opponent/track)를 **E2E/IL 학습 입력에 맞게 선별·가공**한 것. `collect` 종료 시 자동 생성되고
+`ac-process dataset/<run>` 으로 수동 생성도 된다. **raw는 그대로 보존**되므로 언제든 재생성/변경 가능.
+설계는 E2E 자율주행·레이싱 IL의 표준(운동상태 + 트랙상대 기하 + ego-centric)을 따른다.
+
+### `ego_features` (프레임당 1행) — 자차
+운동상태 중심으로 선별(타이어/서스펜션/휠하중 등 **동역학 디테일은 제외**, 필요 시 `telemetry_raw`에서 추출).
+- 키: `frame, t_img`
+- 운동: `speed`, `velocity_x/y/z`, `local_velocity_x/y/z`(차체기준), `accelX/Y`, `angular_velocity_x/y/z`, `yaw_rate`(=angular_velocity_y)
+- 자세: `yaw, pitch, roll` / 위치: `world_position_x/y/z`, `NormalizedSplinePosition`
+- 상태: `RPM, actualGear, LapCount, numberOfTyresOut, LapInvalidated, isInPit`
+- 라벨: `steer, throttle, brake`
+
+### `opponent/opp_<id>_features` (상대차별 파일, 프레임당 1행) — 상대차
+raw `opponent/opp_<id>/` 와 동일하게 **상대차마다 파일 하나**. camera/ego_state 와 프레임 정렬(행 i = 프레임 i).
+| 필드 | 의미 |
+|---|---|
+| `frame, t_img, opp_id, present` | 정렬 키 + 존재여부 |
+| `opp_x, opp_y` | **절대 좌표** (= ego world_position + rel). BEV/궤적 분석용 |
+| `opp_forward, opp_lateral` | **ego-frame** 상대위치 (자차 진행방향 기준 앞/옆 거리). 모델 입력 표준 |
+| `distance` | 자차-상대차 수평거리 (m) |
+| `opp_vx, opp_vy, opp_speed` | 상대차 속도벡터·속력. **플러그인 실측 속도(SpeedMS) + 진행방향(opp_yaw)** 으로 구성 |
+| `rel_vx, rel_vy, closing_speed` | 자차 대비 상대속도 / 접근속도(+면 가까워짐) |
+| `opp_yaw, opp_speedKMH` | 상대차 방향·속도(플러그인 원본) |
+
+> **속도는 위치 시간차분을 쓰지 않는다.** 상대차 위치는 ~47Hz로 갱신되지만 드물게(~0.5%) stale/held
+> 프레임이 있어 시간차분이 0↔폭주로 튄다(대부분의 중복은 차가 실제 정지한 구간이라 정상). 그래서 시간차분
+> 대신 플러그인 실측 속도 + 진행방향(위치기반 방향과 0.2도 일치 확인)으로 속도벡터를 만든다 → 물리적으로
+> 정확·글리치 없음. (opp_id는 세션 내내 고정 = 같은 차.)
+
+### `track_features` (프레임당 1행) — 레이싱 라인 대비
+| 필드 | 의미 |
+|---|---|
+| `frame, t_img` | 정렬 키 |
+| `lateral_offset` | 레이싱 라인에서 벗어난 횡거리 (부호 +=왼쪽) |
+| `heading_error` | 자차 방향 − 라인 접선 방향 (rad) |
+| `curvature` | 현재 지점 곡률 (1/m, 클수록 급코너) |
+| `dist_left_edge, dist_right_edge` | 좌/우 트랙 경계까지 거리 (m) |
+
+---
+
 ## 패키지 구조 / 파일
 
 ```
@@ -188,16 +234,18 @@ Summer_USRG/
     pyproject.toml                # 패키지 정의 + 의존성 + CLI 진입점
     README.md
     src/ac_dataset/
-        __init__.py               # 공개 API: collect, build_dataset
-        collect.py                # 주행 중 두 로거 동시 실행 → 종료 시 자동 정렬
+        __init__.py               # 공개 API: collect, build_dataset, extract_track_for_run, build_processed
+        collect.py                # 수집 메인 → 종료 시 정렬/track/후처리까지 자동
         schema.py                 # ego/action/opponent 필드 정의 + 추출 헬퍼 (필드명 single source)
+        track.py                  # 트랙 자동식별 + fast_lane.ai 파싱 → track/ (맵+레이싱라인)
+        processed_builder.py      # raw → processed/ (E2E/IL용 선별·가공 피처)
         view.py                   # parquet 미리보기/CSV 뷰어
         recorder/
             telemetry_logger.py   # ego+action+opponents raw 기록 (AC 플러그인 state)
             ac_telemetry.py       # ego_server(UDP 2345)에서 자차 state 수신
             ac_opponents.py       # opponents_server(TCP 2346)에서 상대차 수신
             screen_capture.py     # 화면 캡처 (dxcam 우선 → mss 폴백, region 지정 가능)
-            image_logger.py       # 캡처 프레임을 camera/ 에 PNG + index로 저장
+            image_logger.py       # 캡처 프레임을 camera/ 에 JPG + index로 저장
             dataset_builder.py    # raw → camera/ ego_state/ opponent/ 폴더로 정렬·분리
     tests/test_offline.py         # 게임 없이 서로 다른 주기 raw 생성 → 정렬 검증
     dataset/                      # 수집 결과 (git 미추적)
@@ -211,7 +259,7 @@ cd Summer_USRG
 pip install -e .            # 의존성 자동 설치 + collect / ac-build / ac-view 명령 생성
 pip install -e ".[capture]" # (선택) Windows에서 더 빠른 dxcam 캡처 백엔드까지
 ```
-설치하면 아래 명령들을 **어느 폴더에서든** 쓸 수 있다: `collect`, `ac-build`, `ac-view`, `ac-track`.
+설치하면 아래 명령들을 **어느 폴더에서든** 쓸 수 있다: `collect`, `ac-build`, `ac-view`, `ac-track`, `ac-process`.
 
 ## 사용법
 
@@ -229,9 +277,10 @@ collect --capture-region 0,80,1920,945   # 기본 telemetry 50Hz / image 50Hz(JP
 
 > 코드로 부르려면: `from ac_dataset import collect; collect(out_dir="./dataset")`
 
-**트랙 맵 + 레이싱 라인만 (재)추출** (`collect` 시 자동 생성되지만 수동으로도)
+**트랙/후처리 (재)생성** (`collect` 시 자동 생성되지만 수동으로도)
 ```bash
-ac-track dataset/<run_id>            # 주행 좌표로 트랙 자동 식별 → track/ 생성
+ac-track   dataset/<run_id>          # 주행 좌표로 트랙 자동 식별 → track/ 생성
+ac-process dataset/<run_id>          # raw → processed/ (E2E/IL용 선별·가공 피처)
 ```
 
 **기존 raw run을 새 폴더 구조로 (재)정렬**

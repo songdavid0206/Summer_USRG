@@ -204,6 +204,13 @@ def collect(out_dir: str, run_id: str | None = None,
     except Exception as e:
         print(f"[track] 맵/레이싱라인 추출 스킵: {e}")
 
+    # 후처리 → processed/ 폴더 (E2E/IL 학습용 선별·가공 피처). raw는 그대로 보존.
+    try:
+        from .processed_builder import build_processed
+        build_processed(run_dir)
+    except Exception as e:
+        print(f"[processed] 후처리 스킵: {e}")
+
     return run_dir
 
 

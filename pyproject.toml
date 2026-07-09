@@ -26,6 +26,7 @@ collect = "ac_dataset.collect:main"
 ac-build = "ac_dataset.recorder.dataset_builder:main"
 ac-view = "ac_dataset.view:main"
 ac-track = "ac_dataset.track:main"
+ac-process = "ac_dataset.processed_builder:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
