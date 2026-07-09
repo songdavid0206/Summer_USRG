@@ -31,10 +31,10 @@ from pathlib import Path
 
 import math
 
-from recorder import TelemetryLogger, ImageLogger, ACTelemetrySource
-from recorder.ac_opponents import ACOpponentsSource
-from recorder.screen_capture import ScreenCapture
-from recorder.dataset_builder import build_dataset
+from .recorder import TelemetryLogger, ImageLogger, ACTelemetrySource
+from .recorder.ac_opponents import ACOpponentsSource
+from .recorder.screen_capture import ScreenCapture
+from .recorder.dataset_builder import build_dataset
 
 
 class Clock:

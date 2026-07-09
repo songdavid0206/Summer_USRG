@@ -168,38 +168,62 @@ state(약 90필드)를 통째로 저장한 것 + 정답 라벨(steer/throttle/br
 
 ---
 
-## 파일
+## 패키지 구조 / 파일
 
-| 파일 | 역할 |
-|---|---|
-| `schema.py` | ego/action/opponent 필드 정의 + 추출 헬퍼 (필드명 single source) |
-| `recorder/telemetry_logger.py` | ego+action+opponents raw 기록 (AC 플러그인 state) |
-| `recorder/ac_telemetry.py` | ego_server(UDP 2345)에서 자차 state 수신 |
-| `recorder/ac_opponents.py` | opponents_server(TCP 2346)에서 상대차 수신 |
-| `recorder/screen_capture.py` | 화면 캡처 (dxcam 우선 → mss 폴백, region 지정 가능) |
-| `recorder/image_logger.py` | 캡처 프레임을 `camera/`에 PNG + index로 저장 |
-| `recorder/dataset_builder.py` | raw → `camera/ ego_state/ opponent/` 폴더로 정렬·분리 |
-| `collect.py` | 사람 주행 중 두 로거 동시 실행 → 종료 시 자동 정렬 |
-| `view.py` | parquet 미리보기/CSV 뷰어 (파일 경로 직접 지정해 사용) |
+```
+Summer_USRG/
+    pyproject.toml                # 패키지 정의 + 의존성 + CLI 진입점
+    README.md
+    src/ac_dataset/
+        __init__.py               # 공개 API: collect, build_dataset
+        collect.py                # 주행 중 두 로거 동시 실행 → 종료 시 자동 정렬
+        schema.py                 # ego/action/opponent 필드 정의 + 추출 헬퍼 (필드명 single source)
+        view.py                   # parquet 미리보기/CSV 뷰어
+        recorder/
+            telemetry_logger.py   # ego+action+opponents raw 기록 (AC 플러그인 state)
+            ac_telemetry.py       # ego_server(UDP 2345)에서 자차 state 수신
+            ac_opponents.py       # opponents_server(TCP 2346)에서 상대차 수신
+            screen_capture.py     # 화면 캡처 (dxcam 우선 → mss 폴백, region 지정 가능)
+            image_logger.py       # 캡처 프레임을 camera/ 에 PNG + index로 저장
+            dataset_builder.py    # raw → camera/ ego_state/ opponent/ 폴더로 정렬·분리
+    tests/test_offline.py         # 게임 없이 서로 다른 주기 raw 생성 → 정렬 검증
+    dataset/                      # 수집 결과 (git 미추적)
+```
+
+## 설치
+
+```bash
+git clone https://github.com/songdavid0206/Summer_USRG.git
+cd Summer_USRG
+pip install -e .            # 의존성 자동 설치 + collect / ac-build / ac-view 명령 생성
+pip install -e ".[capture]" # (선택) Windows에서 더 빠른 dxcam 캡처 백엔드까지
+```
+설치하면 아래 명령들을 **어느 폴더에서든** 쓸 수 있다: `collect`, `ac-build`, `ac-view`.
 
 ## 사용법
 
 **실제 수집 (AC + 플러그인 + CSP 실행 후, 트랙에 진입한 상태)**
 ```bash
-python collect.py                       # 기본값 telemetry 50Hz / image 20Hz, 주 모니터 전체 캡처
-# 게임 창만 잡기: python collect.py --capture-region L,T,W,H
+collect                       # 기본값 telemetry 50Hz / image 20Hz, 주 모니터 전체 캡처
+# 게임 창만 잡기: collect --capture-region L,T,W,H
 # 주행 → Alt+Tab 으로 터미널 이동 → Ctrl+C 로 종료 (게임이 키보드를 잡으므로 Alt+Tab 필수)
 # 종료 시 자동으로 camera/ ego_state/ opponent/ 폴더 + parquet + csv 생성
 ```
+> 코드로 부르려면: `from ac_dataset import collect; collect(out_dir="./dataset")`
 
 **기존 raw run을 새 폴더 구조로 (재)정렬**
 ```bash
-python -m recorder.dataset_builder dataset/<run_id> --tolerance 0.05
+ac-build dataset/<run_id> --tolerance 0.05
 ```
 
 **데이터 확인**
 - 엑셀: 각 폴더의 `.csv` 를 바로 열기 (`ego_state/ego_state.csv` 등).
-- 터미널: `python view.py dataset/<run_id>/ego_state/ego_state.parquet --csv`
+- 터미널: `ac-view dataset/<run_id>/ego_state/ego_state.parquet --csv`
+
+**오프라인 테스트 (게임 불필요)**
+```bash
+python tests/test_offline.py
+```
 
 ## 참고 / 주의
 

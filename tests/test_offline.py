@@ -6,20 +6,18 @@ telemetry(50Hz) 와 image(20Hz)를 '서로 다른 주기 + 약간의 지터'로 
 raw 로 쌓은 뒤, sync_run 이 이미지마다 가장 가까운 telemetry를 제대로 붙이는지 검증한다.
 상대차(opponents)도 몇 프레임에 넣어 opp_count가 반영되는지 확인.
 
-실행:  python tests/test_offline.py   (ac_dataset/ 에서)
+실행:  pip install -e .  후  python tests/test_offline.py
 """
 
 import os
-import sys
 import shutil
 
 import numpy as np
 
-# ac_dataset/ 를 import 경로에 추가
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from recorder import TelemetryLogger, ImageLogger      # noqa: E402
-from recorder.sync import sync_run                      # noqa: E402
-from schema import ACTION_MAP                           # noqa: E402
+# 설치된 패키지에서 import (pip install -e . 후)
+from ac_dataset.recorder import TelemetryLogger, ImageLogger
+from ac_dataset.recorder.sync import sync_run
+from ac_dataset.schema import ACTION_MAP
 
 
 def fake_state(i: int) -> dict:

@@ -139,7 +139,7 @@ def build_dataset(run_dir: str | Path, tolerance: float = 0.05) -> dict:
     return summary
 
 
-if __name__ == "__main__":
+def main():
     import argparse
 
     ap = argparse.ArgumentParser(
@@ -148,3 +148,7 @@ if __name__ == "__main__":
     ap.add_argument("--tolerance", type=float, default=0.05, help="허용 시간차(초)")
     args = ap.parse_args()
     build_dataset(args.run_dir, tolerance=args.tolerance)
+
+
+if __name__ == "__main__":
+    main()

@@ -21,16 +21,12 @@ TelemetryLogger - ego + action + opponents raw 스트림 기록
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 from pathlib import Path
 
 import pandas as pd
 
-# schema.py 를 ac_dataset/ 어디서 실행하든 import 되게 부모 경로 보강
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from schema import split_state, OPPONENT_FIELDS  # noqa: E402
+from ..schema import split_state, OPPONENT_FIELDS
 
 
 class TelemetryLogger:

@@ -6,6 +6,11 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 패키지 빌드 산출물 (pip install -e . 등이 생성)
+*.egg-info/
+build/
+dist/
+
 # 테스트 캡처 이미지 / 백업본
 shot*.png
 *.bak
