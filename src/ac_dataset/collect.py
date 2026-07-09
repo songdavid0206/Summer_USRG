@@ -80,11 +80,12 @@ def build_opponents(state: dict, opp_list: list[dict] | None) -> list[dict] | No
 
 
 def collect(out_dir: str, run_id: str | None = None,
-            telemetry_hz: float = 50.0, image_hz: float = 20.0,
+            telemetry_hz: float = 50.0, image_hz: float = 50.0,
             max_seconds: float | None = None,
             host: str = "127.0.0.1", port: int = 2345, opp_port: int = 2346,
             capture_region: tuple[int, int, int, int] | None = None,
-            capture_backend: str = "auto") -> Path:
+            capture_backend: str = "auto",
+            image_format: str = "jpg") -> Path:
     """사람 주행 데이터 수집 메인 루프.
 
     telemetry_hz / image_hz : 각 스트림의 목표 기록 주파수(서로 달라도 됨).
@@ -92,6 +93,7 @@ def collect(out_dir: str, run_id: str | None = None,
     host / port             : sensors_par ego_server 주소(기본 127.0.0.1:2345).
     capture_region          : (left, top, width, height). None이면 주 모니터 전체.
     capture_backend         : "auto"(dxcam→mss) | "dxcam" | "mss".
+    image_format            : "jpg"(빠름/작음) | "png"(무손실/느림).
     """
     run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(out_dir) / run_id
@@ -118,7 +120,8 @@ def collect(out_dir: str, run_id: str | None = None,
     screen = ScreenCapture(region=capture_region, backend=capture_backend)
     print(f"[capture] backend={screen.backend} region={capture_region or 'full monitor'}")
     tel_logger = TelemetryLogger(run_dir)
-    img_logger = ImageLogger(run_dir)
+    img_logger = ImageLogger(run_dir, image_ext=image_format)
+    print(f"[capture] image_format={img_logger.image_ext}")
 
     clock = Clock()
     tel_period = 1.0 / telemetry_hz
@@ -157,13 +160,24 @@ def collect(out_dir: str, run_id: str | None = None,
     except KeyboardInterrupt:
         print("\n[stop] 사용자 종료")
     finally:
+        elapsed = clock.now()
         tel_summary = tel_logger.flush()
         img_summary = img_logger.flush()
+        # 실제 달성 Hz = 기록된 개수 / 총 수집시간
+        tel_hz_actual = tel_summary.get("telemetry_rows", 0) / elapsed if elapsed > 0 else 0
+        img_hz_actual = img_summary.get("image_frames", 0) / elapsed if elapsed > 0 else 0
+        opp_hz_actual = (opp_src.received / elapsed) if (opp_src and elapsed > 0) else 0
+        print(f"[rate] 실측  telemetry {tel_hz_actual:.1f}Hz / image {img_hz_actual:.1f}Hz "
+              f"/ opponents {opp_hz_actual:.1f}Hz  (목표 {telemetry_hz}/{image_hz}Hz, {elapsed:.1f}s)")
         meta = {
             "run_dir": str(run_dir),
             "source": "human_driving",
             "telemetry_hz": telemetry_hz,
             "image_hz": image_hz,
+            "telemetry_hz_actual": round(tel_hz_actual, 2),
+            "image_hz_actual": round(img_hz_actual, 2),
+            "elapsed_seconds": round(elapsed, 2),
+            "image_format": img_logger.image_ext,
             "ego_server": f"{host}:{port}",
             "opponents_server": f"{host}:{opp_port}" if opp_src else None,
             "telemetry_recv_total": tel_src.received,
@@ -197,7 +211,7 @@ def main():
     ap = argparse.ArgumentParser(description="AC human-driving dataset collector (UDP telemetry)")
     ap.add_argument("--out", default="./dataset", help="데이터셋 저장 폴더")
     ap.add_argument("--telemetry-hz", type=float, default=50.0)
-    ap.add_argument("--image-hz", type=float, default=20.0)
+    ap.add_argument("--image-hz", type=float, default=50.0)
     ap.add_argument("--max-seconds", type=float, default=None, help="수집 시간 제한(초)")
     ap.add_argument("--host", default="127.0.0.1", help="ego_server 호스트")
     ap.add_argument("--port", type=int, default=2345, help="ego_server 포트")
@@ -206,6 +220,8 @@ def main():
                     choices=["auto", "dxcam", "mss"], help="화면 캡처 백엔드")
     ap.add_argument("--capture-region", default=None,
                     help="left,top,width,height (예: 0,0,640,480). 생략 시 주 모니터 전체")
+    ap.add_argument("--image-format", default="jpg", choices=["jpg", "png"],
+                    help="이미지 저장 포맷: jpg(빠름/작음, 기본) | png(무손실/느림)")
     args = ap.parse_args()
 
     region = (tuple(int(x) for x in args.capture_region.split(","))
@@ -215,7 +231,8 @@ def main():
             telemetry_hz=args.telemetry_hz, image_hz=args.image_hz,
             max_seconds=args.max_seconds, host=args.host, port=args.port,
             opp_port=args.opp_port,
-            capture_region=region, capture_backend=args.capture_backend)
+            capture_region=region, capture_backend=args.capture_backend,
+            image_format=args.image_format)
 
 
 if __name__ == "__main__":

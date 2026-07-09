@@ -22,11 +22,14 @@ from PIL import Image
 
 
 class ImageLogger:
-    def __init__(self, run_dir: str | Path, image_ext: str = "png"):
+    def __init__(self, run_dir: str | Path, image_ext: str = "jpg",
+                 jpg_quality: int = 95):
         self.run_dir = Path(run_dir)
         self.img_dir = self.run_dir / "camera"
         self.img_dir.mkdir(parents=True, exist_ok=True)
-        self.image_ext = image_ext
+        # jpeg -> jpg 로 통일
+        self.image_ext = "jpg" if image_ext.lower() in ("jpg", "jpeg") else image_ext.lower()
+        self.jpg_quality = jpg_quality
         self._rows: list[dict] = []
         self.frame_idx = 0
 
@@ -52,7 +55,12 @@ class ImageLogger:
         """
         arr = self._to_uint8(image)
         rel_path = f"camera/{self.frame_idx:06d}.{self.image_ext}"
-        Image.fromarray(arr).save(self.run_dir / rel_path)
+        img = Image.fromarray(arr)
+        if self.image_ext == "jpg":
+            # JPG: PNG보다 인코딩 훨씬 빠르고 용량 작음(무손실은 아님). 품질 95로 손실 최소화.
+            img.save(self.run_dir / rel_path, quality=self.jpg_quality)
+        else:
+            img.save(self.run_dir / rel_path)
 
         self._rows.append({
             "frame": self.frame_idx,

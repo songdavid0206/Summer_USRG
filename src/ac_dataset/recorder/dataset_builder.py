@@ -101,9 +101,10 @@ def build_dataset(run_dir: str | Path, tolerance: float = 0.05) -> dict:
     # index에 없는 자투리 png 정리(예: Ctrl+C가 저장 직후·기록 직전에 걸려 타임스탬프 없이
     # 남은 마지막 프레임). 정렬된 프레임만 남긴다.
     kept = {r["image_path"].split("/")[-1] for r in cam_rows}
-    for png in cam_dir.glob("*.png"):
-        if png.name not in kept:
-            png.unlink()
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        for f in cam_dir.glob(ext):
+            if f.name not in kept:
+                f.unlink()
 
     # --------------------------------------------------------------- ego_state
     ego_df = merged[[c for c in merged.columns if c not in _DROP_FOR_EGO]].copy()
