@@ -182,6 +182,14 @@ def collect(out_dir: str, run_id: str | None = None,
 
     # 수집 종료 후 오프라인 정렬 → camera/ ego_state/ opponent/ 폴더 구조로 저장
     build_dataset(run_dir)
+
+    # 맵정보 + 레이싱 라인 추출 → track/ 폴더 (best-effort; 트랙 파일 없거나 식별 실패해도 계속)
+    try:
+        from .track import extract_track_for_run
+        extract_track_for_run(run_dir)
+    except Exception as e:
+        print(f"[track] 맵/레이싱라인 추출 스킵: {e}")
+
     return run_dir
 
 

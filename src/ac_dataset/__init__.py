@@ -11,6 +11,8 @@
 
 from .collect import collect
 from .recorder.dataset_builder import build_dataset
+from .track import parse_fast_lane, extract_track_for_run, identify_track
 
-__all__ = ["collect", "build_dataset"]
+__all__ = ["collect", "build_dataset",
+           "parse_fast_lane", "extract_track_for_run", "identify_track"]
 __version__ = "0.1.0"
