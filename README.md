@@ -7,54 +7,67 @@
 > 참조 레포는 게임 데이터를 받아 RL을 하는 코드다. 우리가 만드는 건 그 학습 코드가
 > 아니라, 그 앞 단계인 **데이터셋 수집 시스템**이다. 모은 데이터는 이후 IL/RL에 쓴다.
 
+## 현재 상태 (2026-07-08)
+
+**게임 실주행 + AI 자동주행 수집 전 구간 동작.** 한 번의 `collect` 로 아래를 **모두 ~50Hz**로 취득:
+`카메라 이미지(JPG) + ego(자차) + opponent(상대차) + 조작값 라벨 + track(맵/레이싱라인)`.
+Assetto Corsa + sensors_par 플러그인(CSP 필요)에서 telemetry를, dxcam으로 화면을 캡처한다.
+
 ## 설계 핵심 — 방법 C (raw 따로 기록 → 오프라인 정렬)
 
-이미지와 telemetry는 **주기가 다르다**(telemetry 50Hz / image 20Hz). 실시간으로 묶으면
+telemetry와 image는 **각자 주기로** 들어온다(현재 둘 다 목표 50Hz). 실시간으로 묶으면
 나중에 시각 어긋남을 검증/보정할 수 없다. 그래서 각자 timestamp를 달아 raw로 쌓아두고,
 수집이 끝난 뒤 **카메라 프레임 기준으로 정렬**한다.
 
 ```
-[사람이 AC 주행]  ── 같은 시계(Clock) ──►  두 스트림을 각자 timestamp 달아 raw 저장
-   telemetry(50Hz) → telemetry_raw.parquet   (ego 전체 + steer/throttle/brake)   ← AC 플러그인 UDP 2345
-                     opponents_raw.parquet    (t, opp_id, ...)  ※ 상대 있을 때만  ← AC 플러그인 TCP 2346
-   image(20Hz)     → image_index.parquet + camera/*.png                          ← 화면 캡처(dxcam/mss)
+[AC 주행 (사람 또는 AI)]  ── 같은 시계(Clock) ──►  각 스트림을 각자 timestamp 달아 raw 저장
+   telemetry(~50Hz) → telemetry_raw.parquet   (ego 전체 + steer/throttle/brake)  ← 플러그인 UDP 2345
+                      opponents_raw.parquet    (t, opp_id, ...)  ※ 상대 있을 때만 ← 플러그인 TCP 2346
+   image(~50Hz)     → image_index.parquet + camera/*.jpg                         ← 화면 캡처(dxcam)
                                    │
-                                   ▼  recorder.dataset_builder (오프라인, merge_asof nearest)
-              camera/ + ego_state/ + opponent/opp_<id>/   ← 스트림별 폴더로 분리한 최종 dataset
+                                   ▼  dataset_builder (오프라인, merge_asof nearest)
+              camera/ + ego_state/ + opponent/opp_<id>/   ← 스트림별 폴더로 분리
+                                   +  track/  ← 트랙 맵 + 레이싱 라인 (fast_lane.ai 파싱)
 ```
 
 - **정렬 기준 = 카메라 프레임.** 이미지 한 장마다 시간이 가장 가까운 telemetry tick을 붙인다
   (`merge_asof` nearest, tolerance 50ms). **모든 프레임을 유지**하므로
-  `camera/{i}.png` ↔ `ego_state` 행 i ↔ 각 `opp_<id>` 행 i 가 **항상 1:1로 대응**하고
+  `camera/{i}.jpg` ↔ `ego_state` 행 i ↔ 각 `opp_<id>` 행 i 가 **항상 1:1로 대응**하고
   세 폴더의 행 개수가 정확히 같다.
-- **이미지는 우리가 직접 화면 캡처**(dxcam→mss 폴백)한다. 한 프로세스·한 Clock이라
-  image↔telemetry 동기화가 정확(실측 dt≈0ms).
-- **action(정답 라벨)은 제어를 내보내지 않고 telemetry에서 읽는다.** 사람 주행을 방해하지
+- **이미지는 우리가 직접 화면 캡처**(dxcam→mss 폴백). 한 프로세스·한 Clock이라
+  image↔telemetry 동기화가 정확(둘 다 50Hz면 실측 dt≈0ms). JPG 저장(PNG보다 12배 빠름).
+- **action(정답 라벨)은 제어를 내보내지 않고 telemetry에서 읽는다.** 주행을 방해하지
   않도록 state의 `steerAngle/accStatus/brakeStatus`를 canonical `steer/throttle/brake`로 라벨링.
+  (AI 자동주행 시엔 AI의 조작값이 그대로 라벨 = IL 전문가 데이터)
 - **opponent는 가변 개수**라 그 run에 등장한 `opp_id`마다 폴더를 하나씩 자동 생성(하드코딩 아님).
   상대 없는 세션이면 `opponent/` 자체가 생성되지 않는다.
+- **track은 자동**: 주행 좌표로 설치된 트랙을 식별해 `fast_lane.ai`에서 레이싱 라인+맵을 뽑는다.
 
 ## 출력 구조
 
 ```
 dataset/<run_id>/                     # run_id = 수집 시각 (YYYYMMDD_HHMMSS)
     camera/
-        000000.png, 000001.png, ...   # 프레임별 이미지 (파일명 = frame 번호)
+        000000.jpg, 000001.jpg, ...   # 프레임별 이미지 (파일명 = frame 번호, JPG q95)
         camera_index.parquet / .csv   # frame, t_img, image_path
     ego_state/
         ego_state.parquet / .csv      # 프레임당 1행: 자차 state 전체 + steer/throttle/brake
     opponent/
         opp_<id>/opp_<id>.parquet/.csv  # 프레임당 1행: 그 상대차의 상대위치·속도 (present 플래그 포함)
+    track/
+        racing_line.parquet / .csv    # 레이싱 라인 + 트랙 폭(맵) + AI 속도 프로파일
+        track.json                    # 트랙 이름, 점 개수, 식별 정확도
     ── raw 소스(백업, 재정렬용) ──
     image_index.parquet               # frame ↔ t ↔ image_path
-    telemetry_raw.parquet             # tick별 ego 전체 + steer/throttle/brake
+    telemetry_raw.parquet             # tick별 ego 전체 + steer/throttle/brake (고주파 원본)
     opponents_raw.parquet             # (t, opp_id, rel_x, rel_y, ...)  ※ optional
-    meta.json                         # 수집 설정/요약
+    meta.json                         # 수집 설정/요약 (실측 Hz 포함)
 ```
 
 - 모든 데이터파일은 **parquet + csv 동시** 저장 (parquet=로딩용, csv=엑셀 확인용).
-- raw 3종(`image_index`, `telemetry_raw`, `opponents_raw`)만 있으면 언제든 재정렬 가능:
-  `python -m recorder.dataset_builder dataset/<run_id>`
+- raw 3종(`image_index`, `telemetry_raw`, `opponents_raw`)만 있으면 언제든 재정렬 가능: `ac-build dataset/<run_id>`
+- 정렬된 폴더(camera/ego_state/opponent)는 결국 **image Hz로 캡핑**된다. telemetry가 더 높아도
+  ego_state는 이미지에 맞춰진 rate이며, **고주파 원본은 `telemetry_raw.parquet`에 그대로 보존**된다.
 
 ---
 
@@ -67,7 +80,7 @@ state(약 90필드)를 통째로 저장한 것 + 정답 라벨(steer/throttle/br
 ### 정렬·식별·시간
 | 필드 | 의미 |
 |---|---|
-| `frame` | 카메라 프레임 번호 (`camera/{frame:06d}.png` 와 대응) |
+| `frame` | 카메라 프레임 번호 (`camera/{frame:06d}.jpg` 와 대응) |
 | `t_img` | 이 프레임(이미지) timestamp (수집 시작 기준 초) |
 | `t_tel` | 붙은 telemetry tick의 timestamp (초) |
 | `dt` | `|t_img − t_tel|` 시간차 (초). 0에 가까울수록 정렬 정확 |
@@ -198,18 +211,28 @@ cd Summer_USRG
 pip install -e .            # 의존성 자동 설치 + collect / ac-build / ac-view 명령 생성
 pip install -e ".[capture]" # (선택) Windows에서 더 빠른 dxcam 캡처 백엔드까지
 ```
-설치하면 아래 명령들을 **어느 폴더에서든** 쓸 수 있다: `collect`, `ac-build`, `ac-view`.
+설치하면 아래 명령들을 **어느 폴더에서든** 쓸 수 있다: `collect`, `ac-build`, `ac-view`, `ac-track`.
 
 ## 사용법
 
 **실제 수집 (AC + 플러그인 + CSP 실행 후, 트랙에 진입한 상태)**
 ```bash
-collect                       # 기본값 telemetry 50Hz / image 20Hz, 주 모니터 전체 캡처
-# 게임 창만 잡기: collect --capture-region L,T,W,H
-# 주행 → Alt+Tab 으로 터미널 이동 → Ctrl+C 로 종료 (게임이 키보드를 잡으므로 Alt+Tab 필수)
-# 종료 시 자동으로 camera/ ego_state/ opponent/ 폴더 + parquet + csv 생성
+collect --capture-region 0,80,1920,945   # 기본 telemetry 50Hz / image 50Hz(JPG), 지정 영역만 캡처
+# 주행(사람 또는 AI) → Alt+Tab 으로 터미널 이동 → Ctrl+C 로 종료 (게임이 키보드를 잡으므로 Alt+Tab 필수)
+# 종료 시 자동으로 camera/ ego_state/ opponent/ track/ 폴더 + parquet + csv 생성
 ```
+- **HUD는 게임에서 꺼두되, `--capture-region`으로 남는 UI 요소(상단 배너/하단 스트립 등)까지 잘라낸다.**
+  값 `L,T,W,H`는 게임 해상도/화면에 맞게 조정(예: 1920×1080에서 위 80px·아래 55px 잘라내면 `0,80,1920,945`).
+- `--telemetry-hz`, `--image-hz` : 목표 주파수(기본 둘 다 50). `--image-format jpg|png`.
+- **AI 자동주행 수집**: 트랙 주행 중 게임 창에서 `Ctrl+C` → AC 내장 AI가 대신 운전. 그 상태로 `collect` 하면
+  AI 조작값이 라벨로 저장돼 IL 전문가 데이터가 된다. (게임 Ctrl+C = AI토글, 터미널 Ctrl+C = 수집종료)
+
 > 코드로 부르려면: `from ac_dataset import collect; collect(out_dir="./dataset")`
+
+**트랙 맵 + 레이싱 라인만 (재)추출** (`collect` 시 자동 생성되지만 수동으로도)
+```bash
+ac-track dataset/<run_id>            # 주행 좌표로 트랙 자동 식별 → track/ 생성
+```
 
 **기존 raw run을 새 폴더 구조로 (재)정렬**
 ```bash
@@ -225,11 +248,26 @@ ac-build dataset/<run_id> --tolerance 0.05
 python tests/test_offline.py
 ```
 
+## 수집 주파수(Hz) — 실측 결과와 한계
+
+목표 Hz는 `--telemetry-hz`, `--image-hz`로 준다(기본 둘 다 50). **수집 종료 시 `[rate]`로 실측 Hz가 출력**되고
+`meta.json`에도 저장된다. 각 스트림의 실제 한계:
+
+| 스트림 | 실측 한계 | 무엇이 막나 |
+|---|---|---|
+| **telemetry(ego)** | ~50Hz | **게임 FPS.** ego는 플러그인 `acUpdate()`에서 나가므로 게임 렌더레이트에 종속. FPS 올리면 상승 |
+| **image** | ~50Hz | 캡처+JPG인코딩(~18ms/장) + 모니터 주사율(보통 60). PNG였으면 ~5Hz(인코딩 176ms) |
+| **opponents** | ~50Hz | 플러그인 `sensors_par.py`의 opponents 송신 `time.sleep()` 값. 낮출수록↑(0.008≈50Hz), 단 AC 구형 파이썬 불안정 위험 |
+
+- **한 루프 커플링 주의**: collect가 아직 단일 루프라 `--image-hz`를 너무 높이면(예 100) 느린 이미지 캡처가
+  루프를 잡아 telemetry까지 끌어내린다(image50→tel99, image100→tel50). 이미지를 과하게 올리지 말 것.
+  진짜 독립하려면 스레드 분리 필요(단 ego가 게임FPS에 묶여 이득은 게임FPS를 올릴 때만).
+- **용량**: image 50Hz JPG(q95, 1920×945) ≈ 초당 35MB. 대량 수집 시 시간/품질(q85) 조절.
+
 ## 참고 / 주의
 
-- **HUD**: 속도계/맵이 이미지에 찍히면 학습이 편법으로 흐를 수 있음 → 게임 HUD 끄거나 region으로 잘라내기.
+- **HUD**: 게임에서 HUD를 꺼도 일부 UI(상단 배너·하단 스트립 등)가 남으므로, `--capture-region`으로 그 영역까지 잘라낸다. (속도계/맵이 이미지에 찍히면 학습이 편법으로 흐름)
 - **캡처 세팅**: AC를 테두리 없는 창(borderless windowed)으로 실행 권장(전체화면 독점은 캡처가 검게 나올 수 있음).
-- **수집 속도**: 현재 실측 ~5Hz. 원인은 dxcam 전체모니터 캡처가 메인루프를 블로킹 → `--capture-region`으로
-  게임창만 잡거나 이미지 캡처를 별도 스레드로 분리하면 개선.
-- **좌표축**: 속도 벡터의 수평면은 (x, z)이고 y=수직. 상대차 rel_x/rel_y는 위치 x,y 차이로 계산된 값이라,
-  등수 등 진행방향 판정 시에는 ego 위치 변화로 heading을 구해 투영하는 방식이 안전.
+- **raw 카메라**: AC는 렌더 이미지를 API로 주지 않음 → **화면 캡처가 유일**. 대신 숫자로 **BEV(탑다운) 이미지**는 생성 가능.
+- **좌표축**: ego world_position 수평면은 (x, y), z=높이. AI 파일(fast_lane.ai)은 축 순서가 달라 `ego(x,y,z)=AI(z,x,y)`로
+  변환해 저장(track.py). 등수 등 진행방향 판정 시엔 ego 위치 변화로 heading을 구해 투영하는 방식이 안전.
