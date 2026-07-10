@@ -92,6 +92,22 @@ def _line_xy(df: pd.DataFrame) -> np.ndarray:
     return df[["x", "y"]].to_numpy()
 
 
+def _ai_paths(tracks_dir: Path) -> list[Path]:
+    """설치된 모든 fast_lane.ai 경로.
+
+    트랙은 두 형태다: `<track>/ai/fast_lane.ai` (레이아웃 없음) 와
+    `<track>/<layout>/ai/fast_lane.ai` (레이아웃 있음, 예: ks_silverstone/gp).
+    둘 다 훑지 않으면 레이아웃 트랙을 통째로 놓친다.
+    """
+    return sorted(tracks_dir.glob("*/ai/fast_lane.ai")) + \
+        sorted(tracks_dir.glob("*/*/ai/fast_lane.ai"))
+
+
+def _track_name(ai_path: Path, tracks_dir: Path) -> str:
+    """fast_lane.ai 경로 → 트랙 이름(레이아웃 포함, 예: 'ks_silverstone/gp')."""
+    return ai_path.relative_to(tracks_dir).parent.parent.as_posix()
+
+
 def identify_track(ego: pd.DataFrame, tracks_dir: str | Path = DEFAULT_TRACKS_DIR
                    ) -> tuple[str | None, float]:
     """ego world_position 을 설치된 모든 트랙 AI 라인과 비교해 트랙 이름 추정.
@@ -107,8 +123,8 @@ def identify_track(ego: pd.DataFrame, tracks_dir: str | Path = DEFAULT_TRACKS_DI
     dbox = (px.min(), px.max(), py.min(), py.max())
 
     best, best_d = None, float("inf")
-    for ai_path in sorted(tracks_dir.glob("*/ai/fast_lane.ai")):
-        name = ai_path.parent.parent.name
+    for ai_path in _ai_paths(tracks_dir):
+        name = _track_name(ai_path, tracks_dir)
         try:
             line = _line_xy(parse_fast_lane(ai_path))
         except Exception:
