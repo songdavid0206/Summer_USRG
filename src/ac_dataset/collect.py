@@ -238,6 +238,8 @@ def collect(out_dir: str, run_id: str | None = None,
     except Exception as e:
         print(f"[export] 내보내기 스킵: {e}")
 
+    # 검증(ac-validate)은 수집 파이프라인과 분리한다. 데이터가 저장된 뒤 필요할 때 직접 돌린다:
+    #   ac-validate dataset/<run_id>
     return run_dir
 
 

@@ -14,8 +14,9 @@ from .recorder.dataset_builder import build_dataset
 from .track import parse_fast_lane, extract_track_for_run, identify_track
 from .processed_builder import build_processed
 from .export_frames import export_run
+from .validate import validate_run
 
 __all__ = ["collect", "build_dataset",
            "parse_fast_lane", "extract_track_for_run", "identify_track",
-           "build_processed", "export_run"]
+           "build_processed", "export_run", "validate_run"]
 __version__ = "0.1.0"

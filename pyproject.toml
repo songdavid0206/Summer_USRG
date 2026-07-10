@@ -28,6 +28,7 @@ ac-view = "ac_dataset.view:main"
 ac-track = "ac_dataset.track:main"
 ac-process = "ac_dataset.processed_builder:main"
 ac-export = "ac_dataset.export_frames:main"
+ac-validate = "ac_dataset.validate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
