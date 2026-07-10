@@ -179,14 +179,20 @@ def read_car_specs(car_dir: str | Path) -> dict:
                     hi[i] = max(hi[i], c[i] + s[i] / 2)
                 got = True
                 cur = {}
+    dimension_reliable = False
     if got:
         # (length=z, width=x, height=y)
         dimension = (hi[2] - lo[2], hi[0] - lo[0], hi[1] - lo[1])
+        # AC 의 collider 는 실제 차체 외곽이 아니라 '물리 충돌 판'이다. 레이스카는 롤후프·윙까지
+        # 여러 박스로 세밀해 높이가 잡히지만, 로드카는 바닥 판 하나뿐이라 높이가 ~0.1m 로 무의미.
+        # 길이/폭은 대체로 신뢰할 만하나 높이는 못 믿는 경우가 많다.
+        dimension_reliable = dimension[2] > 0.5
 
     return {
         "car_model": car_dir.name,
         "steer_lock": steer_lock,
-        "dimension": dimension,
+        "dimension": dimension,           # (length, width, height) m — collider bbox
+        "dimension_reliable": dimension_reliable,   # 높이가 물리 판 두께면 False
         "mass": mass,
         "source": "data.acd (car.ini + colliders.ini)",
     }

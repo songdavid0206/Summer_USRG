@@ -56,17 +56,23 @@ G = 9.80665
 DEFAULT_DIMENSION = (4.500, 1.800, 1.000)
 
 
-def _load_dimensions(models: dict[int, str]) -> dict[int, tuple[float, float, float]]:
-    """car_id -> (length, width, height). data.acd 에서 차종별로 읽고 캐시."""
+def _load_dimensions(models: dict[int, str]) -> tuple[dict[int, tuple[float, float, float]], dict[str, bool]]:
+    """car_id -> (length, width, height). data.acd 에서 차종별로 읽고 캐시.
+
+    반환: (car_id별 치수, 차종별 높이신뢰 플래그). AC collider 는 물리 판이라
+    로드카는 높이가 ~0.1m 로 무의미(길이/폭은 대체로 OK). 신뢰 플래그로 표시.
+    """
     from .acd import read_car_specs_by_model
     cache: dict[str, tuple[float, float, float] | None] = {}
+    reliable: dict[str, bool] = {}
     out: dict[int, tuple[float, float, float]] = {}
     for cid, model in models.items():
         if model not in cache:
             specs = read_car_specs_by_model(model)
             cache[model] = tuple(specs["dimension"]) if (specs and specs.get("dimension")) else None
+            reliable[model] = bool(specs and specs.get("dimension_reliable"))
         out[cid] = cache[model] or DEFAULT_DIMENSION
-    return out
+    return out, reliable
 
 
 def _load_steer_lock(models: dict[int, str]) -> float | None:
@@ -172,8 +178,11 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
     hfov_rad = math.radians(hfov) if hfov is not None else read_camera_hfov()
     half_fov = hfov_rad / 2.0
     models = read_car_models()
-    dims = _load_dimensions(models)          # car_id -> (L, W, H), data.acd 에서
-    steer_lock = _load_steer_lock(models)    # 도. steerNorm*steer_lock = 조향각(도)
+    dims, dim_reliable = _load_dimensions(models)   # car_id -> (L, W, H), data.acd 에서
+    steer_lock = _load_steer_lock(models)           # 도. steerNorm*steer_lock = 조향각(도)
+    if dim_reliable and not all(dim_reliable.values()):
+        bad = [m for m, ok in dim_reliable.items() if not ok]
+        print(f"[export] 주의: 높이가 신뢰 불가한 차종(collider 판 두께): {bad}")
 
     # steer 라벨: 정규화된 커맨드(steerNorm). 없으면(구버전 플러그인) 도 단위 그대로 두고 경고.
     if "steerNorm" in ego_raw.columns:
@@ -300,6 +309,7 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
         "car_models": {str(k): v for k, v in models.items()},
         "dimensions": {str(k): list(v) for k, v in dims.items()},
         "dimension_source": "data.acd colliders.ini (bounding box)",
+        "dimension_height_reliable": dim_reliable,
         "note": ("파일명 ms = 실제 t_img 반올림(균일 격자 아님). OBJECT_INFO 는 화각 안 상대차만 "
                  "(차폐 미처리). dimension 은 data.acd(colliders.ini) 박스 합집합 = 게임 실제 값."),
     }
