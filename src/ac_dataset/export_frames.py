@@ -52,13 +52,31 @@ import pandas as pd
 
 G = 9.80665
 
-# AC 가 차체 치수를 주지 않아(API 채널 없음, ui_car.json 에도 없음, collider.ini 는 data.acd 안)
-# 차종별 실제 제원을 상수로 둔다. 휠베이스/윤거는 TyreContactPoint 로 실측되므로 별도 필드.
-CAR_DIMENSIONS: dict[str, tuple[float, float, float]] = {
-    # car_model: (length, width, height) [m]
-    "ks_ferrari_f2004": (4.545, 1.796, 0.959),
-}
+# 차종 치수는 data.acd(colliders.ini)에서 직접 읽는다(acd.py). 읽기 실패 시에만 이 기본값.
 DEFAULT_DIMENSION = (4.500, 1.800, 1.000)
+
+
+def _load_dimensions(models: dict[int, str]) -> dict[int, tuple[float, float, float]]:
+    """car_id -> (length, width, height). data.acd 에서 차종별로 읽고 캐시."""
+    from .acd import read_car_specs_by_model
+    cache: dict[str, tuple[float, float, float] | None] = {}
+    out: dict[int, tuple[float, float, float]] = {}
+    for cid, model in models.items():
+        if model not in cache:
+            specs = read_car_specs_by_model(model)
+            cache[model] = tuple(specs["dimension"]) if (specs and specs.get("dimension")) else None
+        out[cid] = cache[model] or DEFAULT_DIMENSION
+    return out
+
+
+def _load_steer_lock(models: dict[int, str]) -> float | None:
+    """자차(car_id 0) STEER_LOCK(도)을 data.acd 에서. 없으면 None."""
+    from .acd import read_car_specs_by_model
+    model = models.get(0)
+    if not model:
+        return None
+    specs = read_car_specs_by_model(model)
+    return specs["steer_lock"] if specs else None
 
 
 # --------------------------------------------------------------------------- 게임 설정
@@ -154,6 +172,8 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
     hfov_rad = math.radians(hfov) if hfov is not None else read_camera_hfov()
     half_fov = hfov_rad / 2.0
     models = read_car_models()
+    dims = _load_dimensions(models)          # car_id -> (L, W, H), data.acd 에서
+    steer_lock = _load_steer_lock(models)    # 도. steerNorm*steer_lock = 조향각(도)
 
     # steer 라벨: 정규화된 커맨드(steerNorm). 없으면(구버전 플러그인) 도 단위 그대로 두고 경고.
     if "steerNorm" in ego_raw.columns:
@@ -247,7 +267,7 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
             oyaw = float(r["yaw_body"]) if "yaw_body" in o.columns and pd.notna(r["yaw_body"]) \
                 else float(r["opp_yaw"])
             ox, oy, oz, ow = quat_from_ypr(oyaw, 0.0, 0.0)
-            L, W, H = CAR_DIMENSIONS.get(models.get(oid, ""), DEFAULT_DIMENSION)
+            L, W, H = dims.get(oid, DEFAULT_DIMENSION)
 
             # 월드 속도 -> 그 차의 body frame (전진, 좌우, 상하)
             vx, vy = float(r["opp_vx"]), float(r["opp_vy"])
@@ -276,9 +296,12 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
         "hfov_deg": round(math.degrees(hfov_rad), 3),
         "max_range_m": max_range,
         "steer_angle_source": steer_note,
+        "steer_lock_deg": steer_lock,
         "car_models": {str(k): v for k, v in models.items()},
+        "dimensions": {str(k): list(v) for k, v in dims.items()},
+        "dimension_source": "data.acd colliders.ini (bounding box)",
         "note": ("파일명 ms = 실제 t_img 반올림(균일 격자 아님). OBJECT_INFO 는 화각 안 상대차만 "
-                 "(차폐 미처리). dimension 은 AC 가 안 주는 값이라 차종 상수표에서 채움."),
+                 "(차폐 미처리). dimension 은 data.acd(colliders.ini) 박스 합집합 = 게임 실제 값."),
     }
     (out / "export_info.json").write_text(
         json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")

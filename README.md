@@ -107,6 +107,8 @@ state(약 90필드)를 통째로 저장한 것 + 정답 라벨(steer/throttle/br
 > 환산되지 않는다: 소신호 이득은 178.6(≈180)이지만 `|steerNorm|>0.4` 부터 173 으로 포화하고, 커맨드가
 > 결과보다 **앞선다**(AI 주행 시 6프레임=122ms, R²=0.994). **IL 라벨로는 `steerNorm` 을 그대로 쓴다**
 > (정책이 내놓아야 할 값이므로). `steer`(도)는 상태 피처로 보존.
+> 실제 조향각(도)이 필요하면 `steerNorm × STEER_LOCK`. **STEER_LOCK=180°** 는 `data.acd` 의
+> `car.ini [CONTROLS] STEER_LOCK` 에서 확인됨(데이터 회귀의 소신호 이득 178.6 과 일치).
 
 ### 위치·자세 (월드 좌표)
 | 필드 | 의미 |
@@ -350,7 +352,7 @@ dimension.length, dimension.width, dimension.height, velocity.x, velocity.y, vel
 |---|---|---|
 | `position.*` | 상대차 **절대 월드 좌표** | `ego world_position + rel_x/y/z` |
 | `orientation.*` | **차체 방향** 쿼터니언 (pitch=roll=0) | `yaw_body` (바퀴 접지점 기반) |
-| `dimension.*` | 길이/폭/높이 (m) | **차종 상수표** — AC 가 주지 않는 값 |
+| `dimension.*` | 길이/폭/높이 (m) | **`data.acd` 의 colliders.ini** 박스 합집합 (게임 실제 값) |
 | `velocity.*` | **그 차의 차체 기준** 전진/좌우/상하 (m/s) | 플러그인 `velocity`(월드)를 `yaw_body` 로 회전 |
 | `track_id` | 상대차 ID (세션 내내 고정) | `opp_id` |
 
@@ -358,10 +360,11 @@ dimension.length, dimension.width, dimension.height, velocity.x, velocity.y, vel
 > 계산하는 값이라(`atan2(f, l)`) 차가 멈추면 무의미해진다 — 실측: 정지 프레임의 96% 가 정확히 `+45.0°`.
 > `yaw_body` 는 앞바퀴 중점 − 뒷바퀴 중점 벡터라 **정지·스핀 중에도 유효**하다(크래시로 20초간 멈춘
 > 차에서 표준편차 0.15°로 고정, 같은 구간 `opp_yaw` 는 ±90° 로 요동).
-> `dimension` 은 AC 에 API 채널이 없어(ui_car.json 에도 없고 collider.ini 는 data.acd 안에 패킹) 차종별
-> 실제 제원을 상수로 넣는다. 상대차 차종은 `cfg/race.ini` 의 `[CAR_n] MODEL` 로 알 수 있다.
-> 실측된 휠베이스/윤거는 `processed/opponent/` 에 `wheelbase`, `track_width` 로 따로 보존된다
-> (다만 서스펜션·조향으로 변하는 **동적** 값이다).
+> `dimension` 은 **`data.acd` 를 직접 복호화**해서 `colliders.ini` 의 충돌박스 합집합 bounding box 로
+> 얻는다(`acd.py`). AC 파이썬 API 로는 못 얻지만(ui_car.json 에도 없음) 게임 파일 안에는 있다.
+> Content Manager 없이 폴더명 기반 키로 푼다(F2004: 길이 4.80 / 폭 1.65 / 높이 0.985m, STEER_LOCK 180°).
+> 상대차 차종은 `cfg/race.ini` 의 `[CAR_n] MODEL` 로 안다. `data.acd` 읽기 실패 시에만 기본값 사용.
+> 실측 휠베이스/윤거(`processed/opponent/` 의 `wheelbase`, `track_width`)는 별개로, 접지점 기반 **동적** 값이다.
 
 ---
 
@@ -378,6 +381,7 @@ Summer_USRG/
         track.py                  # 트랙 자동식별 + fast_lane.ai 파싱 → track/ (맵+레이싱라인)
         processed_builder.py      # raw → processed/ (E2E/IL용 선별·가공 피처 + 유효 마스크)
         export_frames.py          # processed → CAMERA/EGO_INFO/OBJECT_INFO (프레임별 txt)
+        acd.py                    # data.acd 복호화 → 차량 제원(STEER_LOCK, 충돌박스 치수)
         view.py                   # parquet 미리보기/CSV 뷰어
         recorder/
             telemetry_logger.py   # ego+action+opponents raw 기록 (AC 플러그인 state)
