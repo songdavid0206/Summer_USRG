@@ -7,11 +7,12 @@
 > 참조 레포는 게임 데이터를 받아 RL을 하는 코드다. 우리가 만드는 건 그 학습 코드가
 > 아니라, 그 앞 단계인 **데이터셋 수집 시스템**이다. 모은 데이터는 이후 IL/RL에 쓴다.
 
-## 현재 상태 (2026-07-08)
+## 현재 상태 (2026-07-10)
 
-**게임 실주행 + AI 자동주행 수집 전 구간 동작.** 한 번의 `collect` 로 아래를 **모두 ~50Hz**로 취득:
+**게임 실주행 + AI 자동주행 수집 전 구간 동작.** 한 번의 `collect` 로 아래를 **모두 ~45-50Hz**로 취득:
 `카메라 이미지(JPG) + ego(자차) + opponent(상대차) + 조작값 라벨 + track(맵/레이싱라인)`.
 Assetto Corsa + sensors_par 플러그인(CSP 필요)에서 telemetry를, dxcam으로 화면을 캡처한다.
+후처리(`processed/`)에서 **리타이어/핏 프레임을 마스킹**해 학습에 쓸 프레임만 고를 수 있다.
 
 ## 설계 핵심 — 방법 C (raw 따로 기록 → 오프라인 정렬)
 
@@ -58,9 +59,10 @@ dataset/<run_id>/                     # run_id = 수집 시각 (YYYYMMDD_HHMMSS)
         racing_line.parquet / .csv    # 레이싱 라인 + 트랙 폭(맵) + AI 속도 프로파일
         track.json                    # 트랙 이름, 점 개수, 식별 정확도
     processed/                        # E2E/IL 학습용 후처리 피처 (선별·가공)
-        ego_features.parquet / .csv       # 선별된 자차 운동상태 + 라벨
-        opponent/opp_<id>_features.parquet/.csv  # 상대차별 절대좌표+ego-frame+속도 (프레임 정렬)
+        ego_features.parquet / .csv       # 선별된 자차 운동상태 + 라벨 + in_pit/valid 마스크
+        opponent/opp_<id>_features.parquet/.csv  # 상대차별 절대좌표+ego-frame+속도 + retired/valid 마스크
         track_features.parquet / .csv     # 레이싱 라인 대비 오프셋/heading/곡률/경계거리
+        quality.json                      # 유효 프레임 요약 (핏 구간, opp별 리타이어 시점)
     ── raw 소스(백업, 재정렬용) ──
     image_index.parquet               # frame ↔ t ↔ image_path
     telemetry_raw.parquet             # tick별 ego 전체 + steer/throttle/brake (고주파 원본)
@@ -94,9 +96,14 @@ state(약 90필드)를 통째로 저장한 것 + 정답 라벨(steer/throttle/br
 ### 조작 라벨 (정답 — IL 타깃)
 | 필드 | 의미 |
 |---|---|
-| `steer` | 조향 (부호 = 좌/우), 원본 `steerAngle` |
+| `steer` | 조향각 **도(degree) 단위**, 부호 = 좌/우. 원본 `steerAngle` (`ac.getCarState(id, CS.Steer)`) |
 | `throttle` | 가속 페달 0~1, 원본 `accStatus` |
 | `brake` | 브레이크 페달 0~1, 원본 `brakeStatus` |
+
+> ⚠️ **`steer`는 [-1,1]로 정규화돼 있지 않다.** 관측 범위 예: −138.9°~+107.2° (비대칭은 그 주행의
+> 편향일 뿐 차의 조향 한계가 아니다). 정규화하려면 **차종의 steer lock 상수**로 나눠야 하는데
+> telemetry 90필드에 없다. run별 관측 min/max로 나누면 run마다 라벨 스케일이 어긋나므로 **틀린다.**
+> 정보 손실 없는 순수 나눗셈이라 **차종 확정 후 학습 직전에** 상수로 처리하면 된다.
 
 ### 위치·자세 (월드 좌표)
 | 필드 | 의미 |
@@ -197,6 +204,7 @@ raw(ego_state/opponent/track)를 **E2E/IL 학습 입력에 맞게 선별·가공
 - 운동: `speed`, `velocity_x/y/z`, `local_velocity_x/y/z`(차체기준), `accelX/Y`, `angular_velocity_x/y/z`, `yaw_rate`(=angular_velocity_y)
 - 자세: `yaw, pitch, roll` / 위치: `world_position_x/y/z`, `NormalizedSplinePosition`
 - 상태: `RPM, actualGear, LapCount, numberOfTyresOut, LapInvalidated, isInPit`
+- 마스크: `in_pit`(=isInPit>0), `valid`(=~in_pit) — 아래 "유효 프레임 마스크" 참조
 - 라벨: `steer, throttle, brake`
 
 ### `opponent/opp_<id>_features` (상대차별 파일, 프레임당 1행) — 상대차
@@ -204,6 +212,7 @@ raw `opponent/opp_<id>/` 와 동일하게 **상대차마다 파일 하나**. cam
 | 필드 | 의미 |
 |---|---|
 | `frame, t_img, opp_id, present` | 정렬 키 + 존재여부 |
+| `retired, valid` | 이 차가 이미 핏으로 회수됐는지 / 이 프레임에 쓸 수 있는지(=present & ~retired) |
 | `opp_x, opp_y` | **절대 좌표** (= ego world_position + rel). BEV/궤적 분석용 |
 | `opp_forward, opp_lateral` | **ego-frame** 상대위치 (자차 진행방향 기준 앞/옆 거리). 모델 입력 표준 |
 | `distance` | 자차-상대차 수평거리 (m) |
@@ -224,6 +233,43 @@ raw `opponent/opp_<id>/` 와 동일하게 **상대차마다 파일 하나**. cam
 | `heading_error` | 자차 방향 − 라인 접선 방향 (rad) |
 | `curvature` | 현재 지점 곡률 (1/m, 클수록 급코너) |
 | `dist_left_edge, dist_right_edge` | 좌/우 트랙 경계까지 거리 (m) |
+
+### 유효 프레임 마스크 — 리타이어 / 핏 순간이동
+
+AC는 차가 **리타이어하거나 세션이 끝나면 그 차를 핏 박스로 순간이동시킨 뒤 거기 고정**한다.
+그래도 플러그인은 그 차를 계속 보내므로 `present`는 True로 남는다 — 즉 **`present`는 리타이어
+플래그가 아니다.** 이대로 두면 카메라에는 보이지도 않는 차가 "내 뒤 20m"에 있는 것처럼 피처에
+남아 학습을 오염시킨다(핏 박스들은 10m 간격으로 나란히 놓여 있다). 자차도 세션 종료 시 같은
+방식으로 개러지에 되돌아간다(주행 중 86m/s → 다음 프레임 speed 0, `isInPit=1`).
+
+그래서 후처리가 이를 검출해 **bool 마스크 컬럼**으로 표시한다.
+
+| 컬럼 | 파일 | 의미 |
+|---|---|---|
+| `in_pit` / `valid` | `ego_features` | 자차가 핏에 있는 프레임 → 주행 데이터 아님 |
+| `retired` / `valid` | `opp_<id>_features` | 그 상대차가 이미 핏 박스에 있음 → 그 차만 제외 |
+
+- **행은 지우지 않는다.** `row i ↔ camera/{i:06d}.jpg` 1:1 대응이 데이터셋 전체의 전제라, 행을
+  삭제하면 이미지 인덱스가 어긋난다. 값도 그대로 두고 마스크만 추가한다(raw 보존 원칙).
+- **검출 규칙**(`_detect_retirement`): ① 한 프레임에 10m 넘게 이동(=순간이동) **그리고**
+  ② 그 뒤 끝까지 그 자리에 고정(1m 이내, 속도<1km/h). **두 조건이 모두** 필요하다.
+  "멈춤"만으로 판정하면 **크래시로 트랙에 서 있는 차까지 지워버리는데**, 그 차는 카메라에
+  실제로 보이므로 오히려 남겨야 할 장애물 데이터다. 10m 임계값은 45Hz·300km/h의 프레임당
+  이동(1.9m)과 위치 held를 감안한 실측 최대(3.4m)의 3배 여유.
+- **`quality.json`** 에 요약이 남는다: 총 프레임 수, 자차 핏 진입 프레임/시각,
+  상대차별 `retired_frame / retired_t / teleport_m / pit_box_xy / valid_frames`.
+- 마스킹은 `processed/` 에만 있다. `telemetry_raw` / `opponents_raw` / `ego_state` / `opponent/`
+  (raw·정렬층)에는 없다. 임계값을 바꾸고 싶으면 재수집 없이 `ac-process` 만 다시 돌리면 된다.
+
+**학습 시 사용법**
+```python
+ego = pd.read_parquet("dataset/<run>/processed/ego_features.parquet")
+opp = pd.read_parquet("dataset/<run>/processed/opponent/opp_2_features.parquet")
+
+frames = ego.loc[ego.valid, "frame"].to_numpy()   # 자차가 주행 중인 프레임만
+# 그 프레임에서 실제 트랙 위에 있는 상대차만 (차마다 따로 판정)
+opp_now = opp[opp.frame.isin(frames) & opp.valid]
+```
 
 ---
 
@@ -304,14 +350,24 @@ python tests/test_offline.py
 
 | 스트림 | 실측 한계 | 무엇이 막나 |
 |---|---|---|
-| **telemetry(ego)** | ~50Hz | **게임 FPS.** ego는 플러그인 `acUpdate()`에서 나가므로 게임 렌더레이트에 종속. FPS 올리면 상승 |
-| **image** | ~50Hz | 캡처+JPG인코딩(~18ms/장) + 모니터 주사율(보통 60). PNG였으면 ~5Hz(인코딩 176ms) |
+| **telemetry(ego)** | ~90Hz 수신 / **기록은 루프 속도** | 플러그인은 ~90Hz로 보내준다(중복 0%). 기록 rate는 아래 루프 병목에 묶임 |
+| **image** | ~45Hz | 캡처(dxcam) + JPG 인코딩·저장. 실측 q95 1920×945 = **9.6ms/장**. PNG였으면 ~5Hz(176ms) |
 | **opponents** | ~50Hz | 플러그인 `sensors_par.py`의 opponents 송신 `time.sleep()` 값. 낮출수록↑(0.008≈50Hz), 단 AC 구형 파이썬 불안정 위험 |
 
-- **한 루프 커플링 주의**: collect가 아직 단일 루프라 `--image-hz`를 너무 높이면(예 100) 느린 이미지 캡처가
-  루프를 잡아 telemetry까지 끌어내린다(image50→tel99, image100→tel50). 이미지를 과하게 올리지 말 것.
-  진짜 독립하려면 스레드 분리 필요(단 ego가 게임FPS에 묶여 이득은 게임FPS를 올릴 때만).
-- **용량**: image 50Hz JPG(q95, 1920×945) ≈ 초당 35MB. 대량 수집 시 시간/품질(q85) 조절.
+- **단일 루프 lock-step**: collect는 아직 telemetry와 image가 **한 루프**에 있고 둘 다 50Hz로
+  스케줄되므로 **항상 같은 반복에서 함께** 발화한다. 그래서 `[rate]` 출력의 두 값이 소수점까지
+  같으면(예: `45.3 / 45.3`) 루프가 목표 주기를 못 지킨다는 뜻이다.
+  실측 루프 1바퀴 = **22.07ms** > 목표 20ms → `1/0.02207 = 45.3Hz`. 스케줄러가 catch-up을 하지
+  않으므로 **한 번 밀리면 실측 Hz = 루프 속도**가 된다.
+  - 이때 병목은 **telemetry가 아니다**: 플러그인에서 89.8Hz로 들어오고 기록된 행의 `packetId`가
+    전부 고유(중복 0%) — 게임 틱의 절반을 버리는 중이다. 범인은 이미지 경로(인코딩+디스크).
+  - `--image-hz`를 과하게 올리면(예 100) 이미지가 루프를 잡아 telemetry까지 더 끌어내린다.
+  - 50Hz를 확실히 지키려면 **이미지 캡처/저장을 별도 스레드+큐로 분리**해야 한다(미구현).
+    분리하면 현재 `dt≈0`(둘이 같은 반복에서 찍힘)이 최대 10ms로 벌어지지만 `merge_asof`가 처리한다.
+- **원격 데스크톱(RDP)에서는 ~33Hz**로 떨어진다. dxcam이 실제 GPU 출력 대신 RDP 화면을 잡기 때문.
+  **로컬(그 PC 앞)에서 수집할 것.**
+- **용량**: image 45Hz JPG(q95, 1920×945) ≈ 초당 32MB (686KB/장). 대량 수집 시 품질(q85 → 8.4ms,
+  파일 ~30%↓) 조절.
 
 ## 참고 / 주의
 

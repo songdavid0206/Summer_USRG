@@ -11,11 +11,25 @@ raw(camera/ego_state/opponent/track)는 그대로 두고, `processed/` 폴더에
 좌표계 메모: ego world_position 수평면은 (x, y). 자차 진행방향 = yaw (위치평면 heading과
 평균 0.8도로 일치 확인). 그래서 ego-frame 회전은 (cos yaw, sin yaw)를 forward로 사용.
 
-출력: <run>/processed/ego_features.{parquet,csv}, opponent_features.{...}, track_features.{...}
+유효 프레임 마스크
+------------------
+AC는 리타이어하거나 세션이 끝난 차를 핏 박스로 '순간이동'시킨 뒤 그 자리에 고정한다.
+플러그인은 그 뒤로도 그 차를 계속 보내므로 present=True가 유지된다 → 카메라에는 보이지도
+않는 차가 "내 뒤 20m"에 있는 것처럼 피처에 남아 학습을 오염시킨다. 자차도 세션 종료 시
+같은 방식으로 개러지에 되돌아간다.
+행을 지우지는 않는다(row i ↔ camera/{i:06d}.jpg 1:1 대응이 데이터셋 전체의 전제).
+대신 bool 마스크 컬럼을 붙여 학습 시 걸러 쓴다:
+  - ego_features.in_pit / .valid          (자차가 핏에 있는 프레임 제외)
+  - opp_<id>_features.retired / .valid    (그 상대차가 이미 핏 박스에 있는 프레임 제외)
+요약은 processed/quality.json 에 기록.
+
+출력: <run>/processed/ego_features.{parquet,csv}, opponent/opp_<id>_features.{...},
+      track_features.{...}, quality.json
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -51,11 +65,41 @@ def _wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
+# 리타이어 = 핏 박스로 순간이동 후 영구 고정. 그 두 조건으로 시점을 찾는다.
+# 45Hz에서 300km/h면 한 프레임에 1.9m, 상대차 위치가 1프레임 held되어도 4m 남짓.
+# 10m를 넘는 이동은 물리적으로 불가능 → 순간이동.
+TELEPORT_M = 10.0
+STATIC_M = 1.0      # 순간이동 뒤 이 반경 안에 머물면 '고정됨'
+STATIC_KMH = 1.0    # 그리고 사실상 정지
+
+
+def _detect_retirement(x: np.ndarray, y: np.ndarray, speed_kmh: np.ndarray) -> int | None:
+    """핏 박스에 고정된 첫 프레임 인덱스. 리타이어가 없으면 None.
+
+    트랙 위에 그냥 멈춰 선 차(사고 등)는 카메라에 실제로 보이므로 제외해선 안 된다.
+    그래서 '정지'만으로는 판정하지 않고 반드시 순간이동을 동반해야 한다.
+    """
+    if len(x) < 2:
+        return None
+    step = np.hypot(np.diff(x), np.diff(y))
+    for k in np.where(step > TELEPORT_M)[0] + 1:   # k = 점프해서 도착한 프레임
+        # 도착 후 끝까지 그 자리에 머물러야 리타이어. (한 번 튀고 다시 달리면 글리치)
+        if (np.hypot(x[k:] - x[-1], y[k:] - y[-1]).max() < STATIC_M
+                and np.nanmedian(speed_kmh[k:]) < STATIC_KMH):
+            return int(k)
+    return None
+
+
 def _build_ego(ego: pd.DataFrame) -> pd.DataFrame:
     cols = ["frame", "t_img"] + [c for c in EGO_KEEP if c in ego.columns]
     out = ego[cols].copy()
     if "angular_velocity_y" in ego.columns:
         out["yaw_rate"] = ego["angular_velocity_y"]   # 요레이트(직관적 별칭)
+    # 자차가 핏(개러지)에 있는 프레임 = 주행 데이터가 아님. 세션 종료 시 순간이동으로 들어간다.
+    in_pit = (ego["isInPit"].to_numpy() > 0) if "isInPit" in ego.columns \
+        else np.zeros(len(ego), dtype=bool)
+    out["in_pit"] = in_pit
+    out["valid"] = ~in_pit
     return out
 
 
@@ -99,7 +143,15 @@ def _build_opponents(run_dir: Path, ego: pd.DataFrame) -> dict[int, pd.DataFrame
             o["closing_speed"] = -((o["rel_x"] * o["rel_vx"]
                                     + o["rel_y"] * o["rel_vy"]) / o["distance"])
         o["opp_id"] = oid
-        keep = ["frame", "t_img", "opp_id", "present",
+        # 리타이어 이후 프레임은 값은 그대로 두되(raw 보존) 마스크로 표시만 한다.
+        ret_k = _detect_retirement(o["opp_x"].to_numpy(), o["opp_y"].to_numpy(),
+                                   o["opp_speedKMH"].to_numpy())
+        retired = np.zeros(len(o), dtype=bool)
+        if ret_k is not None:
+            retired[ret_k:] = True
+        o["retired"] = retired
+        o["valid"] = o["present"].to_numpy().astype(bool) & ~retired
+        keep = ["frame", "t_img", "opp_id", "present", "retired", "valid",
                 "opp_x", "opp_y", "opp_forward", "opp_lateral", "distance",
                 "opp_vx", "opp_vy", "opp_speed", "rel_vx", "rel_vy", "closing_speed",
                 "opp_yaw", "opp_speedKMH"]
@@ -180,16 +232,70 @@ def build_processed(run_dir: str | Path) -> dict:
     if trk_f is not None:
         _save(trk_f, out / "track_features")
 
+    quality = _build_quality(ego_f, opp_dict)
+    (out / "quality.json").write_text(
+        json.dumps(quality, indent=2, ensure_ascii=False), encoding="utf-8")
+
     summary = {
         "ego_rows": len(ego_f), "ego_cols": len(ego_f.columns),
         "n_opponents": len(opp_dict),
         "opponent_ids": sorted(opp_dict),
         "track_features": trk_f is not None,
+        "quality": quality,
     }
     print(f"[processed] ego {summary['ego_cols']}열×{summary['ego_rows']} / "
           f"opponent {summary['n_opponents']}대(opp별 파일) / "
           f"track {'O' if trk_f is not None else 'X'} -> {out}")
+    eq = quality["ego"]
+    print(f"[quality] 유효 프레임 {eq['valid_frames']}/{quality['n_frames']} "
+          f"(핏 {eq['in_pit_frames']} 제외)")
+    for oid in sorted(opp_dict):
+        q = quality["opponents"][str(oid)]
+        if q["retired_frame"] is None:
+            print(f"[quality]   opp_{oid}: 리타이어 없음, 유효 {q['valid_frames']}프레임")
+        else:
+            print(f"[quality]   opp_{oid}: t={q['retired_t']:.1f}s 리타이어"
+                  f"(순간이동 {q['teleport_m']:.0f}m) → 이후 {q['retired_frames']}프레임 제외, "
+                  f"유효 {q['valid_frames']}")
     return summary
+
+
+def _build_quality(ego_f: pd.DataFrame, opp_dict: dict[int, pd.DataFrame]) -> dict:
+    """유효 프레임 마스크 요약. 학습 스크립트가 이 파일만 읽어도 상황 파악되게."""
+    n = len(ego_f)
+    in_pit = ego_f["in_pit"].to_numpy()
+    first_pit = int(np.argmax(in_pit)) if in_pit.any() else None
+    ego_q = {
+        "in_pit_frames": int(in_pit.sum()),
+        "first_in_pit_frame": first_pit,
+        "first_in_pit_t": float(ego_f["t_img"].iloc[first_pit]) if first_pit is not None else None,
+        "valid_frames": int((~in_pit).sum()),
+    }
+    opps = {}
+    for oid, df in opp_dict.items():
+        ret = df["retired"].to_numpy()
+        k = int(np.argmax(ret)) if ret.any() else None
+        jump = None
+        if k is not None and k > 0:
+            jump = float(np.hypot(df["opp_x"].iloc[k] - df["opp_x"].iloc[k - 1],
+                                  df["opp_y"].iloc[k] - df["opp_y"].iloc[k - 1]))
+        opps[str(oid)] = {
+            "retired_frame": k,
+            "retired_t": float(df["t_img"].iloc[k]) if k is not None else None,
+            "teleport_m": jump,
+            "pit_box_xy": [float(df["opp_x"].iloc[-1]), float(df["opp_y"].iloc[-1])]
+            if k is not None else None,
+            "retired_frames": int(ret.sum()),
+            "valid_frames": int(df["valid"].to_numpy().sum()),
+        }
+    return {
+        "n_frames": n,
+        "ego": ego_q,
+        "opponents": opps,
+        "note": ("행은 지우지 않는다(row i ↔ camera/{i:06d}.jpg). 학습 시 "
+                 "ego_features.valid 로 프레임을 고르고, 각 opp_<id>_features.valid 로 "
+                 "그 프레임에 실제 트랙 위에 있는 상대차만 쓴다."),
+    }
 
 
 def main():
