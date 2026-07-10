@@ -51,31 +51,51 @@ class Clock:
 def build_opponents(state: dict, opp_list: list[dict] | None) -> list[dict] | None:
     """opponents_server에서 받은 원본 상대차 리스트를 ego 기준 상대좌표로 변환.
 
-    opp_list  : [{'id':.., 'world_position':[x,y,z], 'speedKMH':.., 'yaw':..}, ...] 또는 None
-    반환       : [{opp_id, rel_x, rel_y, distance, opp_speedKMH, opp_yaw}, ...] 또는 None
+    opp_list  : [{'id':.., 'world_position':[x,y,z], 'velocity':[x,y,z], 'speedKMH':.., 'yaw':..}]
+    반환       : [{opp_id, rel_x, rel_y, rel_z, distance, opp_speedKMH, opp_yaw,
+                  opp_vx, opp_vy, opp_vz}, ...] 또는 None
 
-    ego world_position_x/y 와 상대차 world_position[0]/[1] 은 같은 좌표계(structures.py 확인).
+    ego world_position_x/y/z 와 상대차 world_position[0]/[1]/[2] 는 같은 좌표계(structures.py 확인).
+    velocity 도 같은 축 순서. 구버전 플러그인(velocity 없음)이면 해당 컬럼은 None.
     """
     if not opp_list:
         return None
     ego_x = state.get("world_position_x")
     ego_y = state.get("world_position_y")
+    ego_z = state.get("world_position_z")
     out: list[dict] = []
     for opp in opp_list:
         wp = opp.get("world_position") or [None, None, None]
-        ox, oy = wp[0], wp[1]
+        ox, oy, oz = wp[0], wp[1], wp[2]
         rel_x = (ox - ego_x) if (ox is not None and ego_x is not None) else None
         rel_y = (oy - ego_y) if (oy is not None and ego_y is not None) else None
+        rel_z = (oz - ego_z) if (oz is not None and ego_z is not None) else None
         dist = (math.hypot(rel_x, rel_y)
                 if (rel_x is not None and rel_y is not None) else None)
-        out.append({
+        vel = opp.get("velocity") or [None, None, None]
+        row = {
             "opp_id": opp.get("id"),
             "rel_x": rel_x,
             "rel_y": rel_y,
+            "rel_z": rel_z,
             "distance": dist,
             "opp_speedKMH": opp.get("speedKMH"),
             "opp_yaw": opp.get("yaw"),
-        })
+            # 플러그인 실측 속도벡터(월드). 이전엔 speed+yaw로 재구성했었다.
+            "opp_vx": vel[0],
+            "opp_vy": vel[1],
+            "opp_vz": vel[2],
+        }
+        # TyreContactPoint 실험 필드(플러그인이 보내는 경우에만). 상대차 차체 방향/치수.
+        # tcp_center_* 는 검증용: world_position 과 일치해야 차량별로 동작하는 것.
+        for k in ("tcp_ok", "yaw_body", "wheelbase", "track_width",
+                  "tcp_center_x", "tcp_center_y"):
+            if k in opp:
+                row[k] = opp[k]
+        if "tcp_center_x" in row and ox is not None:
+            row["tcp_err"] = math.hypot(row["tcp_center_x"] - ox,
+                                        row["tcp_center_y"] - oy)
+        out.append(row)
     return out
 
 
@@ -210,6 +230,13 @@ def collect(out_dir: str, run_id: str | None = None,
         build_processed(run_dir)
     except Exception as e:
         print(f"[processed] 후처리 스킵: {e}")
+
+    # 프레임별 txt 데이터셋 → dataset/<run_id>_<track>_<hz>hz/ (CAMERA/EGO_INFO/OBJECT_INFO)
+    try:
+        from .export_frames import export_run
+        export_run(run_dir)
+    except Exception as e:
+        print(f"[export] 내보내기 스킵: {e}")
 
     return run_dir
 

@@ -100,10 +100,13 @@ state(약 90필드)를 통째로 저장한 것 + 정답 라벨(steer/throttle/br
 | `throttle` | 가속 페달 0~1, 원본 `accStatus` |
 | `brake` | 브레이크 페달 0~1, 원본 `brakeStatus` |
 
-> ⚠️ **`steer`는 [-1,1]로 정규화돼 있지 않다.** 관측 범위 예: −138.9°~+107.2° (비대칭은 그 주행의
-> 편향일 뿐 차의 조향 한계가 아니다). 정규화하려면 **차종의 steer lock 상수**로 나눠야 하는데
-> telemetry 90필드에 없다. run별 관측 min/max로 나누면 run마다 라벨 스케일이 어긋나므로 **틀린다.**
-> 정보 손실 없는 순수 나눗셈이라 **차종 확정 후 학습 직전에** 상수로 처리하면 된다.
+| `steerNorm` | **정규화된 조작 커맨드 [-1,1]** (`info.physics.steerAngle`) |
+
+> ⚠️ **`steer`(도)와 `steerNorm` 은 서로 다른 물리량이다.** `steerNorm` 은 드라이버(사람/AI)의 **조작
+> 커맨드**이고, `steer` 는 AC 조향필터를 거친 **결과 조향각**이다. 그래서 단일 상수(STEER_LOCK)로
+> 환산되지 않는다: 소신호 이득은 178.6(≈180)이지만 `|steerNorm|>0.4` 부터 173 으로 포화하고, 커맨드가
+> 결과보다 **앞선다**(AI 주행 시 6프레임=122ms, R²=0.994). **IL 라벨로는 `steerNorm` 을 그대로 쓴다**
+> (정책이 내놓아야 할 값이므로). `steer`(도)는 상태 피처로 보존.
 
 ### 위치·자세 (월드 좌표)
 | 필드 | 의미 |
@@ -180,15 +183,23 @@ state(약 90필드)를 통째로 저장한 것 + 정답 라벨(steer/throttle/br
 | 필드 | 의미 |
 |---|---|
 | `frame`, `t_img`, `t_tel` | 카메라 프레임 정렬 컬럼 (ego_state와 동일 축) |
-| `present` | 이 프레임에 이 상대차가 존재했는지 (True/False) |
-| `rel_x`, `rel_y` | 내 차 기준 상대 위치 = (상대 world_position − ego world_position)의 x, y |
+| `present` | 플러그인이 이 프레임에 이 차를 보냈는지. **항상 True** (가시성/리타이어 플래그가 아님) |
+| `rel_x`, `rel_y`, `rel_z` | 내 차 기준 상대 위치 = (상대 world_position − ego world_position) |
 | `distance` | 수평 유클리드 거리 `sqrt(rel_x² + rel_y²)` (m) |
-| `opp_speedKMH` | 상대차 속도 (km/h) |
-| `opp_yaw` | 상대차 진행 방향 (rad) |
+| `opp_speedKMH` | 상대차 속력 (km/h) |
+| `opp_vx`, `opp_vy`, `opp_vz` | 상대차 **월드 속도벡터** (m/s). 플러그인 `CS.Velocity` 실측 |
+| `opp_yaw` | 상대차 **속도벡터의 방향** (rad). 정지 시 무의미 |
+| `yaw_body` | 상대차 **차체 방향** (rad). 앞바퀴중점−뒷바퀴중점. 정지·스핀에도 유효 |
+| `wheelbase`, `track_width` | 접지점 실측 휠베이스/앞윤거 (m). 서스펜션·조향으로 변하는 **동적** 값 |
+| `tcp_ok`, `tcp_center_x/y`, `tcp_err` | TyreContactPoint 성공 여부와 검증용 값 |
 
-- 폴더명 `opp_<id>` 의 `<id>` = 플러그인 `Opponent['id']` (그 run에 나온 값 그대로, 예: 1~4).
-- 상대차 상세 채널(속도/기어/RPM 등)을 늘리려면 플러그인 `Opponent.update()` 에 채널 추가 가능
-  (단, 타차 조작값은 AC가 제공하지 않아 불가).
+- 폴더명 `opp_<id>` 의 `<id>` = 플러그인 `Opponent['id']` (그 run에 나온 값 그대로, 예: 1~5).
+- **`present` 를 가시성이나 리타이어 판정에 쓰면 안 된다.** 플러그인은 트랙의 모든 차를 항상 보낸다.
+  리타이어는 `processed/` 의 `retired`, 가시성은 `ac-export` 의 화각 판정이 담당한다.
+- **속도는 시간차분으로 구하지 않는다.** 상대차 위치는 드물게 held 되어 차분이 0↔폭주로 튄다.
+  플러그인 실측 `velocity` 를 쓴다(검증: `hypot(vx,vy)` vs `speedKMH/3.6` 최대 오차 0.064 m/s = 수직 성분).
+- 상대차 상세 채널을 늘리려면 플러그인 `Opponent.update()` 에 추가 가능
+  (단, **타차 조작값은 AC가 제공하지 않아 불가**).
 
 ---
 
@@ -273,6 +284,87 @@ opp_now = opp[opp.frame.isin(frames) & opp.valid]
 
 ---
 
+## 프레임별 txt 데이터셋 (`ac-export`)
+
+parquet 대신 **프레임 하나당 파일 하나**로 푼 포맷. `collect` 종료 시 자동 생성되고
+`ac-export dataset/<run_id>` 로 수동 생성도 된다. 파일명은 그 프레임의 **시각(ms)** 이다.
+
+```
+dataset/<run_id>_<track>_<hz>hz/
+    CAMERA/0.jpg  20.jpg  40.jpg  61.jpg ...
+    EGO_INFO/0.txt  20.txt ...          # 자차 상태 (key: values)
+    OBJECT_INFO/0.txt  20.txt ...       # 그 프레임에 '보이는' 상대차만 (헤더 + 차당 1행)
+    export_info.json                    # 화각/차종/프레임수 등 요약
+```
+
+- **파일명 ms = 실측 `t_img` 반올림**. 목표 Hz의 균일 격자가 아니라서 간격이 20, 20, 21, 62...
+  처럼 흔들린다(루프 지터가 그대로 드러난다). Hz가 바뀌면 간격도 바뀐다.
+- 자차가 핏에 있는 프레임은 기본적으로 **제외**된다(`--all-frames` 로 포함 가능).
+- 이미지는 하드링크로 이어붙이므로 같은 볼륨이면 **추가 용량 0**.
+
+### 가시성 판정 — "그 프레임에 보이는 차"
+
+AC 는 "이 차가 화면에 보이는가"를 알려주지 않는다. 플러그인은 트랙의 **모든 차를 항상** 보내며,
+`present` 는 전 run 에서 100% True 라 **리타이어 플래그도 가시성 플래그도 아니다.**
+그래서 기하로 계산한다. 상대차가 아래 세 조건을 모두 만족하면 그 프레임에 기록한다:
+
+1. `opp_forward > 0` (자차 앞쪽)
+2. `|atan2(opp_lateral, opp_forward)| <= 수평FOV/2`
+3. `retired == False` (핏으로 회수되지 않음)
+
+수평 FOV 는 게임 설정에서 유도한다: `cfg/camera_onboard.ini` 의 `FOV`(수직) + `cfg/video.ini` 의
+렌더 해상도 → `hfov = 2·atan(tan(vfov/2)·(W/H))`. 기본 세팅(FOV 56, 1920×1080)에서 **86.8°, f≈1016px**.
+실제 이미지에 상대차를 투영해 검증했다(24~124m, 방위각 최대 41°에서 전부 차체에 적중).
+
+- **차폐(occlusion)는 처리하지 않는다.** 앞차 뒤에 완전히 가려진 차도 '보임'으로 들어간다.
+- 카메라가 차 원점에 있다고 근사한다(실제로는 약간의 오프셋. 먼 거리에선 무시 가능).
+- **크래시로 트랙에 서 있는 차는 제외되지 않는다** — 카메라에 실제로 보이는 장애물이기 때문.
+  핏으로 순간이동(`retired`)한 뒤에야 빠진다.
+
+### `EGO_INFO/<ms>.txt` (8줄)
+
+| 줄 | 값 | 단위 / 좌표계 | 원천 |
+|---|---|---|---|
+| `position` | x y z | 월드, z=높이 (m) | `world_position_x/y/z` |
+| `orientation` | qx qy qz qw | 쿼터니언, ZYX(yaw→pitch→roll) | `yaw/pitch/roll` 에서 변환 |
+| `velocity` | 전진 좌우 상하 | **차체 기준** (m/s) | `local_velocity_x/y/z` |
+| `angular_velocity` | roll pitch yaw rate | **deg/s** | `angular_velocity_z/x/y` |
+| `acceleration` | 종 횡 수직 | m/s² (수직은 0) | `accelY·g`, `accelX·g` |
+| `throttle` | 0~1 | — | `accStatus` |
+| `brake` | 0~1 | — | `brakeStatus` |
+| `steer_angle` | **−1~1** | 정규화된 조작 커맨드 | `steerNorm` |
+
+> ⚠️ **원본 필드의 축 순서가 제각각이라 여기서 정리한다.** `local_velocity` 는 플러그인이 재배열했지만
+> **`angular_velocity` 는 재배열하지 않은 원본 축**이다(`angular_velocity_y` 가 yaw rate, 실측 상관 0.948).
+> 그리고 **`accelX` 는 사실 횡가속도, `accelY` 가 종가속도**다(이름이 뒤바뀜; 종가속도가 `d(speed)/dt` 와
+> 상관 0.895, 비율 9.51≈9.81 로 G 단위임도 확인). 필드명을 그대로 믿으면 조용히 틀린다.
+
+### `OBJECT_INFO/<ms>.txt` (헤더 + 보이는 차마다 1행, CSV)
+
+```
+position.x, position.y, position.z, orientation.x, orientation.y, orientation.z, orientation.w,
+dimension.length, dimension.width, dimension.height, velocity.x, velocity.y, velocity.z, track_id
+```
+
+| 필드 | 의미 | 원천 |
+|---|---|---|
+| `position.*` | 상대차 **절대 월드 좌표** | `ego world_position + rel_x/y/z` |
+| `orientation.*` | **차체 방향** 쿼터니언 (pitch=roll=0) | `yaw_body` (바퀴 접지점 기반) |
+| `dimension.*` | 길이/폭/높이 (m) | **차종 상수표** — AC 가 주지 않는 값 |
+| `velocity.*` | **그 차의 차체 기준** 전진/좌우/상하 (m/s) | 플러그인 `velocity`(월드)를 `yaw_body` 로 회전 |
+| `track_id` | 상대차 ID (세션 내내 고정) | `opp_id` |
+
+> **`orientation` 은 `opp_yaw` 가 아니라 `yaw_body` 를 쓴다.** `opp_yaw` 는 플러그인이 **속도벡터**로
+> 계산하는 값이라(`atan2(f, l)`) 차가 멈추면 무의미해진다 — 실측: 정지 프레임의 96% 가 정확히 `+45.0°`.
+> `yaw_body` 는 앞바퀴 중점 − 뒷바퀴 중점 벡터라 **정지·스핀 중에도 유효**하다(크래시로 20초간 멈춘
+> 차에서 표준편차 0.15°로 고정, 같은 구간 `opp_yaw` 는 ±90° 로 요동).
+> `dimension` 은 AC 에 API 채널이 없어(ui_car.json 에도 없고 collider.ini 는 data.acd 안에 패킹) 차종별
+> 실제 제원을 상수로 넣는다. 상대차 차종은 `cfg/race.ini` 의 `[CAR_n] MODEL` 로 알 수 있다.
+> 실측된 휠베이스/윤거는 `processed/opponent/` 에 `wheelbase`, `track_width` 로 따로 보존된다
+> (다만 서스펜션·조향으로 변하는 **동적** 값이다).
+
+---
+
 ## 패키지 구조 / 파일
 
 ```
@@ -284,7 +376,8 @@ Summer_USRG/
         collect.py                # 수집 메인 → 종료 시 정렬/track/후처리까지 자동
         schema.py                 # ego/action/opponent 필드 정의 + 추출 헬퍼 (필드명 single source)
         track.py                  # 트랙 자동식별 + fast_lane.ai 파싱 → track/ (맵+레이싱라인)
-        processed_builder.py      # raw → processed/ (E2E/IL용 선별·가공 피처)
+        processed_builder.py      # raw → processed/ (E2E/IL용 선별·가공 피처 + 유효 마스크)
+        export_frames.py          # processed → CAMERA/EGO_INFO/OBJECT_INFO (프레임별 txt)
         view.py                   # parquet 미리보기/CSV 뷰어
         recorder/
             telemetry_logger.py   # ego+action+opponents raw 기록 (AC 플러그인 state)
@@ -305,7 +398,26 @@ cd Summer_USRG
 pip install -e .            # 의존성 자동 설치 + collect / ac-build / ac-view 명령 생성
 pip install -e ".[capture]" # (선택) Windows에서 더 빠른 dxcam 캡처 백엔드까지
 ```
-설치하면 아래 명령들을 **어느 폴더에서든** 쓸 수 있다: `collect`, `ac-build`, `ac-view`, `ac-track`, `ac-process`.
+설치하면 아래 명령들을 **어느 폴더에서든** 쓸 수 있다:
+`collect`, `ac-build`, `ac-view`, `ac-track`, `ac-process`, `ac-export`.
+
+### ⚠️ 게임 플러그인도 수정해야 한다 (레포 밖)
+
+이 파이프라인은 `sensors_par` 플러그인의 **수정된 버전**을 전제로 한다. 수정 파일은 게임 폴더에 있어
+git 으로 추적되지 않으므로, 게임을 재설치하거나 플러그인을 덮어쓰면 **다시 적용해야 한다.**
+대상: `<AC>/apps/python/sensors_par/` (원본은 `.bak` 으로 백업해 둘 것)
+
+| 파일 | 수정 | 이유 |
+|---|---|---|
+| `sensors_par.py` | 상단에 `import encodings.idna` 사전로드, opponents_server 에 try/except + SO_REUSEADDR, 송신 루프 `time.sleep(0.008)` | 없으면 2346 포트가 조용히 안 열림 / 상대차 ~50Hz |
+| `structures.py` | `Car.update()` 에 `steerNorm = info.physics.steerAngle` | steer 를 [-1,1] 로 쓰기 위해 |
+| `structures.py` | `Opponent.update()` 에 `velocity`, 그리고 `update_body_pose()` (→ `yaw_body`, `wheelbase`, `track_width`, `tcp_center_x/y`, `tcp_ok`) | 상대차 실측 속도벡터 + **차체 방향**(AC 가 안 주는 값) |
+
+- 플러그인 수정은 **세션 재로드**(메뉴 나갔다 트랙 재진입) 후에 적용된다.
+- `Opponent.update_body_pose()` 는 `acsys.CS.TyreContactPoint` 가 **상대차에도 먹힌다**는 사실을 이용한다.
+  검증: 접지점 중심과 `world_position` 의 거리(`tcp_err`)가 5대 모두 0.16m 로 동일(ego 것만 반환했다면
+  차마다 수백 m 로 제각각). 실측 휠베이스 3.05m / 앞윤거 1.47m 는 F2004 실제 제원(3.050 / 1.470)과 일치.
+- 실패해도 수집은 계속된다(`tcp_ok=0`). 구버전 플러그인이면 `processed_builder` 가 옛 방식으로 폴백한다.
 
 ## 사용법
 
@@ -323,10 +435,18 @@ collect --capture-region 0,80,1920,945   # 기본 telemetry 50Hz / image 50Hz(JP
 
 > 코드로 부르려면: `from ac_dataset import collect; collect(out_dir="./dataset")`
 
-**트랙/후처리 (재)생성** (`collect` 시 자동 생성되지만 수동으로도)
+`collect` 는 종료 시 **정렬 → track → processed → export** 까지 자동으로 이어진다.
+수집 중에는 **무거운 작업을 같이 돌리지 말 것** — 단일 루프라 CPU/디스크를 뺏기면 Hz 가 그대로 떨어진다
+(실측: 동시에 이미지 처리 스크립트를 돌렸더니 49.1Hz → 37.7Hz. 게임 telemetry 수신은 69.6Hz 로 멀쩡했다).
+
+**트랙/후처리/내보내기 (재)생성** (`collect` 시 자동 생성되지만 수동으로도)
 ```bash
 ac-track   dataset/<run_id>          # 주행 좌표로 트랙 자동 식별 → track/ 생성
-ac-process dataset/<run_id>          # raw → processed/ (E2E/IL용 선별·가공 피처)
+ac-process dataset/<run_id>          # raw → processed/ (E2E/IL용 선별·가공 피처 + 유효 마스크)
+ac-export  dataset/<run_id>          # processed → CAMERA/EGO_INFO/OBJECT_INFO (프레임별 txt)
+#   --hfov 86.8    화각 직접 지정 (기본: 게임 설정에서 읽음)
+#   --max-range 150   이 거리보다 먼 상대차 제외
+#   --all-frames      자차가 핏에 있는 프레임도 포함
 ```
 
 **기존 raw run을 새 폴더 구조로 (재)정렬**

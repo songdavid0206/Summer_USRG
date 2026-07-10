@@ -39,7 +39,9 @@ import pandas as pd
 
 # ego_state 로 내보낼 때 빼는 보조 컬럼(디버깅/병합 잔재)
 _DROP_FOR_EGO = {"image_path", "t", "wall_time", "wall_time_x", "wall_time_y"}
-_OPP_VALUE_COLS = ["rel_x", "rel_y", "distance", "opp_speedKMH", "opp_yaw"]
+# opponents_raw 에서 값 컬럼은 하드코딩하지 않는다. 플러그인/collect 에 채널이 추가되면
+# (rel_z, opp_vx/vy/vz 등) 자동으로 따라온다. 키 컬럼만 제외.
+_OPP_KEY_COLS = {"t", "t_tel", "opp_id", "wall_time"}
 
 
 def _save(df: pd.DataFrame, base: Path) -> None:
@@ -120,9 +122,10 @@ def build_dataset(run_dir: str | Path, tolerance: float = 0.05) -> dict:
         opp = pd.read_parquet(opp_path)
         frame_key = merged[["frame", "t_img", "t_tel"]]
         opp_ids = sorted(int(i) for i in opp["opp_id"].dropna().unique())
+        value_cols = [c for c in opp.columns if c not in _OPP_KEY_COLS]
         for oid in opp_ids:
             sub = opp[opp["opp_id"] == oid].rename(columns={"t": "t_tel"})
-            sub = sub[["t_tel"] + _OPP_VALUE_COLS]
+            sub = sub[["t_tel"] + value_cols]
             m = frame_key.merge(sub, on="t_tel", how="left")
             m.insert(3, "present", m["rel_x"].notna())
             _save(m, run_dir / "opponent" / f"opp_{oid}" / f"opp_{oid}")

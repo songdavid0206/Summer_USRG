@@ -108,8 +108,10 @@ def _build_opponents(run_dir: Path, ego: pd.DataFrame) -> dict[int, pd.DataFrame
     opp_dirs = sorted((run_dir / "opponent").glob("opp_*"))
     if not opp_dirs:
         return {}
-    ref = ego[["frame", "t_img", "world_position_x", "world_position_y", "yaw", "speed"]].rename(
-        columns={"world_position_x": "ego_x", "world_position_y": "ego_y", "speed": "ego_speed"})
+    ref = ego[["frame", "t_img", "world_position_x", "world_position_y",
+               "world_position_z", "yaw", "speed"]].rename(
+        columns={"world_position_x": "ego_x", "world_position_y": "ego_y",
+                 "world_position_z": "ego_z", "speed": "ego_speed"})
     result: dict[int, pd.DataFrame] = {}
     for d in opp_dirs:
         oid = int(d.name.split("_")[1])
@@ -122,17 +124,23 @@ def _build_opponents(run_dir: Path, ego: pd.DataFrame) -> dict[int, pd.DataFrame
         # 절대좌표
         o["opp_x"] = o["ego_x"] + o["rel_x"]
         o["opp_y"] = o["ego_y"] + o["rel_y"]
+        if "rel_z" in o.columns:
+            o["opp_z"] = o["ego_z"] + o["rel_z"]
         # ego-frame (앞/옆). forward=+진행방향, lateral=+왼쪽
         o["opp_forward"] = o["rel_x"] * c + o["rel_y"] * s
         o["opp_lateral"] = -o["rel_x"] * s + o["rel_y"] * c
-        # 속도: 위치 시간차분은 쓰지 않는다. 상대차 데이터가 프레임 쌍으로 held(≈절반 주기로만 갱신)
-        # 되어 시간차분이 0↔폭주로 튀기 때문. 대신 **플러그인 실측 속도(opp_speedKMH) + 진행방향
-        # (opp_yaw, 위치기반 방향과 0.2도 일치 검증)** 로 속도벡터를 구성 → 물리적으로 정확, 글리치 없음.
-        opp_spd = (o["opp_speedKMH"] / 3.6).to_numpy()   # m/s
-        oyaw = o["opp_yaw"].to_numpy()
-        o["opp_speed"] = opp_spd
-        o["opp_vx"] = opp_spd * np.cos(oyaw)
-        o["opp_vy"] = opp_spd * np.sin(oyaw)
+        # 속도. 위치 시간차분은 절대 쓰지 않는다(held 프레임에서 0↔폭주로 튄다).
+        if "opp_vx" in o.columns and o["opp_vx"].notna().any():
+            # 신형 플러그인: Opponent.velocity 실측 월드 속도벡터를 그대로 쓴다.
+            o["opp_speed"] = np.hypot(o["opp_vx"], o["opp_vy"])
+        else:
+            # 구형 플러그인 폴백: 실측 속력 + 진행방향(opp_yaw)으로 재구성.
+            # opp_yaw 는 속도벡터 방향이라 정지 시 무의미(관측: 정지 프레임 91%가 정확히 +45°).
+            opp_spd = (o["opp_speedKMH"] / 3.6).to_numpy()
+            oyaw = o["opp_yaw"].to_numpy()
+            o["opp_speed"] = opp_spd
+            o["opp_vx"] = opp_spd * np.cos(oyaw)
+            o["opp_vy"] = opp_spd * np.sin(oyaw)
         # 자차 속도벡터도 speed+yaw로 (위치평면 heading=yaw 확인됨)
         ego_spd, eyaw = o["ego_speed"].to_numpy(), o["yaw"].to_numpy()
         ego_vx, ego_vy = ego_spd * np.cos(eyaw), ego_spd * np.sin(eyaw)
@@ -152,9 +160,12 @@ def _build_opponents(run_dir: Path, ego: pd.DataFrame) -> dict[int, pd.DataFrame
         o["retired"] = retired
         o["valid"] = o["present"].to_numpy().astype(bool) & ~retired
         keep = ["frame", "t_img", "opp_id", "present", "retired", "valid",
-                "opp_x", "opp_y", "opp_forward", "opp_lateral", "distance",
-                "opp_vx", "opp_vy", "opp_speed", "rel_vx", "rel_vy", "closing_speed",
-                "opp_yaw", "opp_speedKMH"]
+                "opp_x", "opp_y", "opp_z", "opp_forward", "opp_lateral", "distance",
+                "opp_vx", "opp_vy", "opp_vz", "opp_speed",
+                "rel_vx", "rel_vy", "closing_speed",
+                # yaw_body = 앞바퀴중점-뒷바퀴중점 벡터. 정지·스핀에도 유효한 '차체' 방향.
+                # opp_yaw 는 속도벡터 방향이라 정지 시 못 쓴다.
+                "opp_yaw", "yaw_body", "wheelbase", "track_width", "opp_speedKMH"]
         result[oid] = o[[c for c in keep if c in o.columns]].reset_index(drop=True)
     return result
 

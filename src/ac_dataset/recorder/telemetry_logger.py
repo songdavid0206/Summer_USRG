@@ -53,10 +53,12 @@ class TelemetryLogger:
 
         if opponents:
             for opp in opponents:
+                # 키를 화이트리스트로 거르면 안 된다. 플러그인/collect 에 채널이 늘면
+                # (rel_z, opp_vx/vy/vz, tcp_* 등) 그대로 raw 에 남아야 한다.
+                # OPPONENT_FIELDS 는 '최소 보장 필드'를 앞에 오게 하는 용도일 뿐 필터가 아니다.
                 opp_row = {"t": t}
-                # 스키마 필드만 골라 저장(정의되지 않은 키는 무시)
-                for f in OPPONENT_FIELDS:
-                    opp_row[f] = opp.get(f)
+                opp_row.update({f: opp.get(f) for f in OPPONENT_FIELDS})
+                opp_row.update(opp)
                 self._opp_rows.append(opp_row)
 
     def flush(self) -> dict:
