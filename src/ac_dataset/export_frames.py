@@ -159,15 +159,49 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         shutil.copyfile(src, dst)
 
 
+def _grid_slots(t_img: np.ndarray, grid_hz: float):
+    """실측 시각(t_img, 초, 오름차순)을 균일 격자에 리샘플링.
+
+    격자 = 0, step, 2·step, ... (step = round(1000/hz) ms). 격자점마다 시각이 가장 가까운
+    캡처 프레임을 고른다. 파일명이 정확한 ms 배수가 되어(예: 50Hz → 0,20,40...) 간격이 균일해진다.
+
+    반환: (slots=[(grid_ms, src_frame_idx), ...], step_ms, n_dup, n_gap)
+      - n_dup: 같은 소스 프레임이 연속 격자에 재사용된 횟수(캡처가 격자보다 느릴 때 발생).
+      - n_gap: 격자점 근처(±0.75·step)에 프레임이 없어 건너뛴 칸 수(캡처 스톨).
+    격자 hz 를 캡처가 꾸준히 낼 수 있는 값 이하로 두면 dup·gap 이 0 이 된다.
+    """
+    step_ms = int(round(1000.0 / grid_hz))
+    tol = (step_ms / 1000.0) * 0.75
+    end_ms = int(math.floor(t_img[-1] * 1000.0))
+    grid = np.arange(0, end_ms + 1, step_ms)
+    slots, n_dup, n_gap, last = [], 0, 0, -1
+    for g_ms in grid:
+        g = g_ms / 1000.0
+        pos = int(np.searchsorted(t_img, g))
+        cand = [c for c in (pos - 1, pos) if 0 <= c < len(t_img)]
+        j = min(cand, key=lambda c: abs(t_img[c] - g))
+        if abs(t_img[j] - g) > tol:
+            n_gap += 1
+            continue
+        if j == last:
+            n_dup += 1
+        last = j
+        slots.append((int(g_ms), int(j)))
+    return slots, step_ms, n_dup, n_gap
+
+
 # --------------------------------------------------------------------------- 본체
 def export_run(run_dir: str | Path, out_root: str | Path | None = None,
                hfov: float | None = None, max_range: float | None = None,
-               only_valid: bool = True) -> Path:
+               only_valid: bool = True, grid_hz: float | None = None) -> Path:
     """run 하나를 CAMERA/EGO_INFO/OBJECT_INFO 구조로 내보낸다.
 
     hfov      : 수평 화각(도). None 이면 게임 설정에서 읽는다.
     max_range : 이 거리(m)를 넘는 상대차는 제외. None 이면 거리 제한 없음.
     only_valid: 자차가 핏에 있는 프레임(ego_features.valid=False)은 건너뛴다.
+    grid_hz   : 파일명을 이 Hz 의 **균일 격자**(0, step, 2·step ms)에 맞춰 리샘플링한다.
+                None 이면 수집 목표 Hz(meta.image_hz)를 쓴다. 캡처가 이 Hz 를 못 따라가면
+                같은 프레임이 중복되니(경고), 그때는 더 낮은 값으로 재실행하면 된다(재수집 불필요).
     """
     run_dir = Path(run_dir)
     proc = run_dir / "processed"
@@ -204,7 +238,10 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
     if tj.exists():
         track = json.loads(tj.read_text(encoding="utf-8")).get("track_name", "unknown")
     meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
-    hz = round(meta.get("image_hz_actual", 0))
+    # 출력은 균일 격자 리샘플이므로 폴더 이름 hz = 격자 hz(= 사용자가 지정한 정확한 Hz).
+    if grid_hz is None:
+        grid_hz = float(meta.get("image_hz", meta.get("image_hz_actual", 50)))
+    hz = round(grid_hz)
     name = "%s_%s_%dhz" % (run_dir.name, track.replace("/", "-"), hz)
 
     # 기본 출력 위치는 run 폴더와 나란히 (dataset/<run_id>_<track>_<hz>hz).
@@ -222,17 +259,21 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
                   "dimension.length, dimension.width, dimension.height, "
                   "velocity.x, velocity.y, velocity.z, track_id")
 
-    t_ms = np.rint(cam["t_img"].to_numpy() * 1000.0).astype(np.int64)
-    if len(np.unique(t_ms)) != len(t_ms):
-        print("[export] 경고: ms 반올림 후 중복 파일명 발생 -> 뒤 프레임이 덮어씁니다.")
+    # 실측 시각을 균일 격자에 리샘플 → 파일명이 정확한 ms 배수(간격 균일).
+    t_img = cam["t_img"].to_numpy()
+    slots, step_ms, n_dup, n_gap = _grid_slots(t_img, grid_hz)
+    if n_dup:
+        print(f"[export] 경고: 격자 {hz}Hz 가 캡처보다 빨라 {n_dup}프레임 중복. "
+              f"--grid-hz 를 낮추면(예: {max(10, hz-10)}) 중복이 사라집니다.")
+    if n_gap:
+        print(f"[export] 참고: 캡처 스톨로 {n_gap}개 격자 칸에 프레임 없음(건너뜀).")
 
     ego_valid = ego["valid"].to_numpy() if "valid" in ego.columns else np.ones(len(ego), bool)
     n_written = 0
     n_objects = 0
-    for i in range(len(cam)):
+    for ms, i in slots:
         if only_valid and not ego_valid[i]:
             continue
-        ms = int(t_ms[i])
         e = ego_raw.iloc[i]
 
         # CAMERA: 원본 프레임을 ms 이름으로 복사
@@ -297,8 +338,12 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
     info = {
         "run_id": run_dir.name,
         "track": track,
+        "grid_hz": round(grid_hz, 3),
+        "grid_step_ms": step_ms,
         "frames": n_written,
-        "frames_skipped_ego_invalid": int(len(cam) - n_written) if only_valid else 0,
+        "grid_duplicates": n_dup,
+        "grid_gaps": n_gap,
+        "frames_skipped_ego_invalid": int(len(slots) - n_written) if only_valid else 0,
         "objects_total": n_objects,
         "objects_per_frame": round(n_objects / n_written, 3) if n_written else 0,
         "image_hz_actual": meta.get("image_hz_actual"),
@@ -310,15 +355,16 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
         "dimensions": {str(k): list(v) for k, v in dims.items()},
         "dimension_source": "data.acd colliders.ini (bounding box)",
         "dimension_height_reliable": dim_reliable,
-        "note": ("파일명 ms = 실제 t_img 반올림(균일 격자 아님). OBJECT_INFO 는 화각 안 상대차만 "
-                 "(차폐 미처리). dimension 은 data.acd(colliders.ini) 박스 합집합 = 게임 실제 값."),
+        "note": ("파일명 ms = %dHz 균일 격자(간격 %dms 고정). 각 격자점에 시각이 가장 가까운 "
+                 "캡처 프레임을 배치. OBJECT_INFO 는 화각 안 상대차만(차폐 미처리). "
+                 "dimension 은 data.acd(colliders.ini) 박스 합집합 = 게임 실제 값." % (hz, step_ms)),
     }
     (out / "export_info.json").write_text(
         json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print("[export] %s" % out)
-    print("[export] %d 프레임 (핏 등 제외 %d) | 화각 %.1f도 | 프레임당 평균 %.2f대"
-          % (n_written, len(cam) - n_written, math.degrees(hfov_rad), info["objects_per_frame"]))
+    print("[export] %d 프레임 @ %dHz 균일격자(%dms 간격, 중복 %d/빈칸 %d) | 화각 %.1f도 | 프레임당 평균 %.2f대"
+          % (n_written, hz, step_ms, n_dup, n_gap, math.degrees(hfov_rad), info["objects_per_frame"]))
     return out
 
 
@@ -332,9 +378,11 @@ def main():
                     help="이 거리(m)보다 먼 상대차 제외")
     ap.add_argument("--all-frames", action="store_true",
                     help="자차가 핏에 있는 프레임도 포함")
+    ap.add_argument("--grid-hz", type=float, default=None,
+                    help="파일명 균일 격자 Hz(생략 시 수집 목표 Hz). 중복 뜨면 낮춰서 재실행")
     args = ap.parse_args()
     export_run(args.run_dir, args.out, hfov=args.hfov, max_range=args.max_range,
-               only_valid=not args.all_frames)
+               only_valid=not args.all_frames, grid_hz=args.grid_hz)
 
 
 if __name__ == "__main__":

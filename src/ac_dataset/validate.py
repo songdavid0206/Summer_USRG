@@ -34,7 +34,7 @@ class Check:
 
 
 # --------------------------------------------------------------------------- 1층: 구조
-def _check_structure(run_dir: Path, dt_tol_ms: float = 1.0) -> list[Check]:
+def _check_structure(run_dir: Path, dt_tol_ms: float = 50.0) -> list[Check]:
     checks: list[Check] = []
     cam = pd.read_parquet(run_dir / "camera" / "camera_index.parquet")
     ego = pd.read_parquet(run_dir / "ego_state" / "ego_state.parquet")
@@ -169,7 +169,8 @@ def main():
     import sys
     ap = argparse.ArgumentParser(description="수집 run 자동 검증")
     ap.add_argument("run_dir", help="dataset/<run_id>")
-    ap.add_argument("--dt-tol-ms", type=float, default=1.0, help="정렬 dt 허용 오차(ms)")
+    ap.add_argument("--dt-tol-ms", type=float, default=50.0,
+                    help="정렬 dt 허용 오차(ms). build_dataset 의 merge tolerance 와 맞춤")
     args = ap.parse_args()
     res = validate_run(args.run_dir, dt_tol_ms=args.dt_tol_ms)
     sys.exit(0 if res["passed"] else 1)

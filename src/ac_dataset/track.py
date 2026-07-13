@@ -117,6 +117,12 @@ def identify_track(ego: pd.DataFrame, tracks_dir: str | Path = DEFAULT_TRACKS_DI
     tracks_dir = Path(tracks_dir)
     px = ego["world_position_x"].to_numpy()
     py = ego["world_position_y"].to_numpy()
+    # 정렬 시 telemetry 미매칭 프레임은 위치가 NaN(스레드 분리로 tol 밖 프레임이 생길 수 있음).
+    # NaN 이 하나라도 섞이면 .min()/거리계산이 전부 NaN → 식별이 inf 로 실패하므로 먼저 제거한다.
+    finite = np.isfinite(px) & np.isfinite(py)
+    px, py = px[finite], py[finite]
+    if len(px) == 0:
+        return (None, float("inf"))
     # 주행점 샘플(속도)
     idx = np.linspace(0, len(px) - 1, min(len(px), 200)).astype(int)
     dpts = np.column_stack([px[idx], py[idx]])

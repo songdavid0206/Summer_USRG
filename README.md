@@ -7,11 +7,13 @@
 > 참조 레포는 게임 데이터를 받아 RL을 하는 코드다. 우리가 만드는 건 그 학습 코드가
 > 아니라, 그 앞 단계인 **데이터셋 수집 시스템**이다. 모은 데이터는 이후 IL/RL에 쓴다.
 
-## 현재 상태 (2026-07-10)
+## 현재 상태 (2026-07-13)
 
-**게임 실주행 + AI 자동주행 수집 전 구간 동작.** 한 번의 `collect` 로 아래를 **모두 ~45-50Hz**로 취득:
+**게임 실주행 + AI 자동주행 수집 전 구간 동작.** 한 번의 `collect` 로 아래를 **지정한 Hz**로 취득:
 `카메라 이미지(JPG) + ego(자차) + opponent(상대차) + 조작값 라벨 + track(맵/레이싱라인)`.
 Assetto Corsa + sensors_par 플러그인(CSP 필요)에서 telemetry를, dxcam으로 화면을 캡처한다.
+이미지 캡처는 **별도 스레드**라 telemetry 가 목표 Hz 를 유지하고, 출력 파일명은 **균일 격자**(0,25,50...)다.
+`ac-validate` 로 데이터 무결성을 자동 검사한다. (이 PC 스윗스팟: 40Hz)
 후처리(`processed/`)에서 **리타이어/핏 프레임을 마스킹**해 학습에 쓸 프레임만 고를 수 있다.
 
 ## 설계 핵심 — 방법 C (raw 따로 기록 → 오프라인 정렬)
@@ -35,8 +37,8 @@ telemetry와 image는 **각자 주기로** 들어온다(현재 둘 다 목표 50
   (`merge_asof` nearest, tolerance 50ms). **모든 프레임을 유지**하므로
   `camera/{i}.jpg` ↔ `ego_state` 행 i ↔ 각 `opp_<id>` 행 i 가 **항상 1:1로 대응**하고
   세 폴더의 행 개수가 정확히 같다.
-- **이미지는 우리가 직접 화면 캡처**(dxcam→mss 폴백). 한 프로세스·한 Clock이라
-  image↔telemetry 동기화가 정확(둘 다 50Hz면 실측 dt≈0ms). JPG 저장(PNG보다 12배 빠름).
+- **이미지는 우리가 직접 화면 캡처**(dxcam→mss 폴백). 캡처/인코딩은 별도 스레드(같은 Clock 공유)라
+  메인 루프의 telemetry 가 이미지 부하에 안 막힌다. 정렬 dt 는 중앙 ~1.5ms(스레드별 시각차). JPG 저장.
 - **action(정답 라벨)은 제어를 내보내지 않고 telemetry에서 읽는다.** 주행을 방해하지
   않도록 state의 `steerAngle/accStatus/brakeStatus`를 canonical `steer/throttle/brake`로 라벨링.
   (AI 자동주행 시엔 AI의 조작값이 그대로 라벨 = IL 전문가 데이터)
@@ -289,18 +291,22 @@ opp_now = opp[opp.frame.isin(frames) & opp.valid]
 ## 프레임별 txt 데이터셋 (`ac-export`)
 
 parquet 대신 **프레임 하나당 파일 하나**로 푼 포맷. `collect` 종료 시 자동 생성되고
-`ac-export dataset/<run_id>` 로 수동 생성도 된다. 파일명은 그 프레임의 **시각(ms)** 이다.
+`ac-export dataset/<run_id>` 로 수동 생성도 된다. 파일명은 **균일 격자 위의 시각(ms)** 이다.
 
 ```
 dataset/<run_id>_<track>_<hz>hz/
-    CAMERA/0.jpg  20.jpg  40.jpg  61.jpg ...
+    CAMERA/0.jpg  20.jpg  40.jpg  60.jpg ...   # 50Hz → 20ms 간격 (40Hz면 0,25,50,75...)
     EGO_INFO/0.txt  20.txt ...          # 자차 상태 (key: values)
     OBJECT_INFO/0.txt  20.txt ...       # 그 프레임에 '보이는' 상대차만 (헤더 + 차당 1행)
-    export_info.json                    # 화각/차종/프레임수 등 요약
+    export_info.json                    # 화각/차종/격자 Hz/프레임수 등 요약
 ```
 
-- **파일명 ms = 실측 `t_img` 반올림**. 목표 Hz의 균일 격자가 아니라서 간격이 20, 20, 21, 62...
-  처럼 흔들린다(루프 지터가 그대로 드러난다). Hz가 바뀌면 간격도 바뀐다.
+- **파일명 ms = 균일 격자.** 실측 캡처는 미세하게 흔들리지만(19.8, 20.1ms...), 출력은 목표 Hz 의
+  **정확한 격자**(0, step, 2·step...)에 리샘플한다. 각 격자점에는 시각이 **가장 가까운** 캡처
+  프레임을 배치한다(리샘플 오차 ~2ms). `--grid-hz` 로 격자 Hz 를 바꿀 수 있다(기본 = 수집 목표 Hz).
+- **격자 Hz 는 캡처가 꾸준히 낼 수 있는 값 이하로.** 격자가 캡처보다 빠르면 같은 프레임이 중복된다
+  (`export_info.grid_duplicates` 로 보고, 경고 출력). 그때는 재수집 없이 `--grid-hz` 만 낮춰 재실행.
+  캡처가 스톨한 구간은 그 격자 칸을 **비운다**(`grid_gaps`) — 없는 프레임을 만들어내지 않는다.
 - 자차가 핏에 있는 프레임은 기본적으로 **제외**된다(`--all-frames` 로 포함 가능).
 - 이미지는 하드링크로 이어붙이므로 같은 볼륨이면 **추가 용량 0**.
 
@@ -323,18 +329,33 @@ AC 는 "이 차가 화면에 보이는가"를 알려주지 않는다. 플러그�
 - **크래시로 트랙에 서 있는 차는 제외되지 않는다** — 카메라에 실제로 보이는 장애물이기 때문.
   핏으로 순간이동(`retired`)한 뒤에야 빠진다.
 
+### 좌표계와 단위 (요약)
+
+- **길이 = 미터(m), 시간 = 초(s), 각속도 = 도/초(deg/s), 각도 = 쿼터니언(무차원).**
+- 파일명 `<ms>` = **밀리초**, 수집 시작이 0.
+- `position` 의 좌표계는 **UTM 이 아니다.** Assetto Corsa 의 **트랙별 로컬 월드 좌표**(원점은 트랙마다
+  다르고 임의). 단위만 미터일 뿐 측지 기준·투영대가 없어 위경도로 변환할 수 없다.
+  대신 **한 트랙 안에서는 완전히 고정**이라 차량 간 거리·방향·궤적 계산에 그대로 쓴다.
+  (`opp_forward` 같은 자차 기준 상대좌표와 구분해 "월드 좌표"라고 부른다.)
+- 수평면 = (x, y), **z = 높이**. EGO_INFO 와 OBJECT_INFO 의 `position` 은 **같은 좌표계**다.
+
 ### `EGO_INFO/<ms>.txt` (8줄)
 
-| 줄 | 값 | 단위 / 좌표계 | 원천 |
-|---|---|---|---|
-| `position` | x y z | 월드, z=높이 (m) | `world_position_x/y/z` |
-| `orientation` | qx qy qz qw | 쿼터니언, ZYX(yaw→pitch→roll) | `yaw/pitch/roll` 에서 변환 |
-| `velocity` | 전진 좌우 상하 | **차체 기준** (m/s) | `local_velocity_x/y/z` |
-| `angular_velocity` | roll pitch yaw rate | **deg/s** | `angular_velocity_z/x/y` |
-| `acceleration` | 종 횡 수직 | m/s² (수직은 0) | `accelY·g`, `accelX·g` |
-| `throttle` | 0~1 | — | `accStatus` |
-| `brake` | 0~1 | — | `brakeStatus` |
-| `steer_angle` | **−1~1** | 정규화된 조작 커맨드 | `steerNorm` |
+| 줄 | 성분 | 단위 | 좌표계 / 부호 | 원천 |
+|---|---|---|---|---|
+| `position` | x y z | **m** | 트랙 로컬 월드, z=높이 | `world_position_x/y/z` |
+| `orientation` | qx qy qz qw | **무차원** | 단위 쿼터니언, ZYX(yaw→pitch→roll) | `yaw/pitch/roll` 변환 |
+| `velocity` | 전진 좌우 상하 | **m/s** | **차체 기준**(body) | `local_velocity_x/y/z` |
+| `angular_velocity` | roll pitch yaw rate | **deg/s** | 차체 기준, z=yaw rate | `angular_velocity_z/x/y` |
+| `acceleration` | 종 횡 수직 | **m/s²** | 차체 기준, **수직은 항상 0** | `accelY·g`, `accelX·g` |
+| `throttle` | — | **무차원 0~1** | 1 = 완전 개방 | `accStatus` |
+| `brake` | — | **무차원 0~1** | 1 = 완전 제동 | `brakeStatus` |
+| `steer_angle` | — | **무차원 −1~1** | + 좌 / − 우 | `steerNorm` |
+
+> ⚠️ 함정 셋. ① `angular_velocity` 는 rad/s 가 아니라 **deg/s**(원본 telemetry 는 rad/s, 여기서 변환).
+> ② `acceleration` 의 **수직 성분은 항상 0** — AC 가 주지 않아 자리만 채운 것이므로 실제 값으로 믿으면 안 된다.
+> ③ `steer_angle` 은 **각도가 아니다.** 정규화된 조작 커맨드다. 실제 조향각(도)이 필요하면
+> `steer_angle × STEER_LOCK`(F2004/SF15-T 는 180). STEER_LOCK 은 `export_info.json` 에 있다.
 
 > ⚠️ **원본 필드의 축 순서가 제각각이라 여기서 정리한다.** `local_velocity` 는 플러그인이 재배열했지만
 > **`angular_velocity` 는 재배열하지 않은 원본 축**이다(`angular_velocity_y` 가 yaw rate, 실측 상관 0.948).
@@ -348,13 +369,21 @@ position.x, position.y, position.z, orientation.x, orientation.y, orientation.z,
 dimension.length, dimension.width, dimension.height, velocity.x, velocity.y, velocity.z, track_id
 ```
 
-| 필드 | 의미 | 원천 |
-|---|---|---|
-| `position.*` | 상대차 **절대 월드 좌표** | `ego world_position + rel_x/y/z` |
-| `orientation.*` | **차체 방향** 쿼터니언 (pitch=roll=0) | `yaw_body` (바퀴 접지점 기반) |
-| `dimension.*` | 길이/폭/높이 (m) | **`data.acd` 의 colliders.ini** 박스 합집합 (게임 실제 값) |
-| `velocity.*` | **그 차의 차체 기준** 전진/좌우/상하 (m/s) | 플러그인 `velocity`(월드)를 `yaw_body` 로 회전 |
-| `track_id` | 상대차 ID (세션 내내 고정) | `opp_id` |
+| 필드 | 단위 | 의미 / 좌표계 | 원천 |
+|---|---|---|---|
+| `position.x/y/z` | **m** | 트랙 로컬 월드 (EGO_INFO 와 **같은 좌표계**) | `ego world_position + rel_x/y/z` |
+| `orientation.x/y/z/w` | **무차원** | 차체 방향 쿼터니언. **yaw 만**(pitch=roll=0) | `yaw_body` (바퀴 접지점 기반) |
+| `dimension.length/width/height` | **m** | 차체 박스 | `data.acd` 의 `colliders.ini` 박스 합집합 |
+| `velocity.x/y/z` | **m/s** | **그 상대차의 차체 기준** 전진/좌우/상하 | 플러그인 `velocity`(월드)를 `yaw_body` 로 회전 |
+| `track_id` | **정수** | 상대차 ID. 세션 내내 고정. **0 은 안 나옴**(자차) | `opp_id` |
+
+> ⚠️ 함정 둘. ① **`velocity` 는 상대속도가 아니다.** 자차 대비가 아니라 그 차 자신의 절대 속도이며,
+> 그것도 그 차의 차체 기준이다(예: `54.7` = 그 차가 자기 앞방향으로 초속 54.7m). 자차 대비가 필요하면
+> `processed/opponent/` 의 `rel_vx/rel_vy/closing_speed` 를 쓴다.
+> ② **`orientation` 은 yaw 만 있다**(qx=qy=0). AC 가 상대차의 pitch·roll 을 주지 않는다.
+>
+> 자차의 `dimension`/차종/`STEER_LOCK` 은 프레임마다 변하지 않으므로 EGO_INFO 에 넣지 않고
+> **`export_info.json` 에 run 당 한 번** 기록한다(`car_0` = 자차, `car_1..N` = 상대차).
 
 > **`orientation` 은 `opp_yaw` 가 아니라 `yaw_body` 를 쓴다.** `opp_yaw` 는 플러그인이 **속도벡터**로
 > 계산하는 값이라(`atan2(f, l)`) 차가 멈추면 무의미해진다 — 실측: 정지 프레임의 96% 가 정확히 `+45.0°`.
@@ -375,13 +404,14 @@ Summer_USRG/
     pyproject.toml                # 패키지 정의 + 의존성 + CLI 진입점
     README.md
     src/ac_dataset/
-        __init__.py               # 공개 API: collect, build_dataset, extract_track_for_run, build_processed
-        collect.py                # 수집 메인 → 종료 시 정렬/track/후처리까지 자동
+        __init__.py               # 공개 API: collect, build_dataset, extract_track_for_run, build_processed, export_run, validate_run
+        collect.py                # 수집 메인 → 종료 시 정렬/track/후처리/export까지 자동
         schema.py                 # ego/action/opponent 필드 정의 + 추출 헬퍼 (필드명 single source)
         track.py                  # 트랙 자동식별 + fast_lane.ai 파싱 → track/ (맵+레이싱라인)
         processed_builder.py      # raw → processed/ (E2E/IL용 선별·가공 피처 + 유효 마스크)
-        export_frames.py          # processed → CAMERA/EGO_INFO/OBJECT_INFO (프레임별 txt)
+        export_frames.py          # processed → CAMERA/EGO_INFO/OBJECT_INFO (균일격자 프레임별 txt)
         acd.py                    # data.acd 복호화 → 차량 제원(STEER_LOCK, 충돌박스 치수)
+        validate.py               # 수집 run 자동 검증(ac-validate) → validation.json
         view.py                   # parquet 미리보기/CSV 뷰어
         recorder/
             telemetry_logger.py   # ego+action+opponents raw 기록 (AC 플러그인 state)
@@ -389,7 +419,8 @@ Summer_USRG/
             ac_opponents.py       # opponents_server(TCP 2346)에서 상대차 수신
             screen_capture.py     # 화면 캡처 (dxcam 우선 → mss 폴백, region 지정 가능)
             image_logger.py       # 캡처 프레임을 camera/ 에 JPG + index로 저장
-            dataset_builder.py    # raw → camera/ ego_state/ opponent/ 폴더로 정렬·분리
+            threaded_image.py     # 이미지 캡처/인코딩 스레드 분리(telemetry 부하 격리)
+            dataset_builder.py    # raw → camera/ ego_state/ opponent/ 정렬·분리(미매칭 프레임 드롭)
     tests/test_offline.py         # 게임 없이 서로 다른 주기 raw 생성 → 정렬 검증
     dataset/                      # 수집 결과 (git 미추적)
 ```
@@ -440,15 +471,17 @@ collect --capture-region 0,80,1920,945   # 기본 telemetry 50Hz / image 50Hz(JP
 > 코드로 부르려면: `from ac_dataset import collect; collect(out_dir="./dataset")`
 
 `collect` 는 종료 시 **정렬 → track → processed → export** 까지 자동으로 이어진다.
-수집 중에는 **무거운 작업을 같이 돌리지 말 것** — 단일 루프라 CPU/디스크를 뺏기면 Hz 가 그대로 떨어진다
-(실측: 동시에 이미지 처리 스크립트를 돌렸더니 49.1Hz → 37.7Hz. 게임 telemetry 수신은 69.6Hz 로 멀쩡했다).
+검증(`ac-validate`)은 여기 포함되지 않는다 — 데이터가 저장된 뒤 필요할 때 따로 돌린다(아래 참조).
+수집 중에는 **무거운 작업(대량 파일 I/O 등)을 같이 돌리지 말 것** — CPU/디스크를 뺏기면 캡처 스톨이
+늘어 이미지 Hz 가 떨어진다(telemetry 는 스레드 분리로 대체로 유지).
 
 **트랙/후처리/내보내기 (재)생성** (`collect` 시 자동 생성되지만 수동으로도)
 ```bash
 ac-track   dataset/<run_id>          # 주행 좌표로 트랙 자동 식별 → track/ 생성
 ac-process dataset/<run_id>          # raw → processed/ (E2E/IL용 선별·가공 피처 + 유효 마스크)
 ac-export  dataset/<run_id>          # processed → CAMERA/EGO_INFO/OBJECT_INFO (프레임별 txt)
-#   --hfov 86.8    화각 직접 지정 (기본: 게임 설정에서 읽음)
+#   --grid-hz 40      파일명 균일 격자 Hz (기본: 수집 목표 Hz). 중복 뜨면 낮춰 재실행
+#   --hfov 86.8       화각 직접 지정 (기본: 게임 설정에서 읽음)
 #   --max-range 150   이 거리보다 먼 상대차 제외
 #   --all-frames      자차가 핏에 있는 프레임도 포함
 ```
@@ -462,6 +495,15 @@ ac-build dataset/<run_id> --tolerance 0.05
 - 엑셀: 각 폴더의 `.csv` 를 바로 열기 (`ego_state/ego_state.csv` 등).
 - 터미널: `ac-view dataset/<run_id>/ego_state/ego_state.parquet --csv`
 
+**자동 검증 (`ac-validate`)** — 수집과 **분리**돼 있어, 저장된 뒤 원할 때 직접 돌린다.
+```bash
+ac-validate dataset/<run_id>          # 원본 run 폴더를 넣는다 (export 폴더 아님)
+```
+run 의 구조 일관성 10개 항목을 PASS/FAIL 로 검사하고 `<run>/validation.json` 에 저장한다:
+행 개수 일치 / jpg 수 / 정렬 dt(≤50ms) / NaN 없음 / 시간 단조성 / export 3폴더 파일명 일치 /
+ms 중복 없음 / **리타이어 상대차가 OBJECT_INFO 에서 빠졌는지**. 하나라도 FAIL 이면 exit code 1.
+(행삭제·NaN·dt오염·시간역행 음성테스트로 FAIL 감지를 확인했다.)
+
 **오프라인 테스트 (게임 불필요)**
 ```bash
 python tests/test_offline.py
@@ -469,26 +511,48 @@ python tests/test_offline.py
 
 ## 수집 주파수(Hz) — 실측 결과와 한계
 
-목표 Hz는 `--telemetry-hz`, `--image-hz`로 준다(기본 둘 다 50). **수집 종료 시 `[rate]`로 실측 Hz가 출력**되고
-`meta.json`에도 저장된다. 각 스트림의 실제 한계:
+목표 Hz는 `--telemetry-hz`, `--image-hz`로 준다(기본 둘 다 50, 서로 달라도 됨).
+**수집 종료 시 `[rate]`로 실측 Hz가 출력**되고 `meta.json` 의 `telemetry_hz_actual` /
+`image_hz_actual` 에 저장된다.
+
+```bash
+collect --capture-region 0,80,1920,945 --telemetry-hz 20 --image-hz 20   # 20Hz 로 취득
+```
+
+> **telemetry 는 이미지에서 분리돼 있다.** 이미지 캡처/인코딩은 별도 스레드가 처리하므로
+> (아래 참조), 메인 루프는 telemetry 만 돌려 게임이 주는 만큼(~50-70Hz)을 유지한다. 이미지가
+> 무거워도 telemetry 를 끌어내리지 않는다.
+>
+> **최종 출력 파일명은 균일 격자다.** 실측 캡처는 미세하게 흔들리지만(std ~2ms), `ac-export` 가
+> 목표 Hz 의 정확한 격자로 리샘플한다(위 "프레임별 txt" 참조). 그래서 지정한 Hz 가 파일명에
+> 그대로 나온다. 격자 Hz 를 캡처 지속 속도 이하로 두면(예: 50 캡처 → 40 격자) 중복·빈칸이 없다.
+
+### 이미지 캡처 스레드 분리
+
+`collect` 는 이미지 경로(grab ~6ms + JPG 인코딩·저장 ~17ms = ~23ms)를 **두 스레드로 분리**한다
+(`recorder/threaded_image.py`):
+- **캡처 스레드**: `image_hz` 주기로 `screen.grab()` 만 하고 (t, frame) 을 큐에 넣는다.
+- **인코더 워커**: 큐에서 꺼내 JPG 인코딩+저장(순서 유지, 프레임 유실 없음).
+
+dxcam grab 과 PIL 인코딩은 네이티브 호출 중 GIL 을 놓아 실제로 병렬 실행된다. 효과(오프라인 실측,
+1080p): 단일 루프 telemetry 21.7Hz → **스레드 분리 50.0Hz**. 부작용으로 정렬 `dt` 가 0 이 아니게
+되지만(각 스트림이 자기 시각에 찍힘) 중앙 ~1.5ms 로 작고, 이게 오히려 실제 시간차를 정직하게 반영한다
+(기존 dt=0 은 "가장 최근 telemetry 를 이미지 시각으로 베껴 적은" 눈속임이었다 — 값은 최대 ~14ms 과거).
+tolerance(50ms) 안에 매칭 안 되는 프레임(주로 종료 직후 큐 잔여)은 `build_dataset` 이 버린다.
+
+각 스트림의 실제 한계:
 
 | 스트림 | 실측 한계 | 무엇이 막나 |
 |---|---|---|
-| **telemetry(ego)** | ~90Hz 수신 / **기록은 루프 속도** | 플러그인은 ~90Hz로 보내준다(중복 0%). 기록 rate는 아래 루프 병목에 묶임 |
-| **image** | ~45Hz | 캡처(dxcam) + JPG 인코딩·저장. 실측 q95 1920×945 = **9.6ms/장**. PNG였으면 ~5Hz(176ms) |
+| **telemetry(ego)** | 목표 Hz 유지 (스레드 분리) | 플러그인은 ~70-90Hz로 보내준다. 메인 루프는 telemetry 만 하므로 목표(예 40/50)를 안정적으로 낸다 |
+| **image** | ~48-50Hz | 캡처(grab ~6ms) + JPG 인코딩·저장(~17ms) = ~23ms. 파이프라인으로 겹쳐 ~50Hz 상한. 순간 스톨이 평균을 조금 깎음 |
 | **opponents** | ~50Hz | 플러그인 `sensors_par.py`의 opponents 송신 `time.sleep()` 값. 낮출수록↑(0.008≈50Hz), 단 AC 구형 파이썬 불안정 위험 |
 
-- **단일 루프 lock-step**: collect는 아직 telemetry와 image가 **한 루프**에 있고 둘 다 50Hz로
-  스케줄되므로 **항상 같은 반복에서 함께** 발화한다. 그래서 `[rate]` 출력의 두 값이 소수점까지
-  같으면(예: `45.3 / 45.3`) 루프가 목표 주기를 못 지킨다는 뜻이다.
-  실측 루프 1바퀴 = **22.07ms** > 목표 20ms → `1/0.02207 = 45.3Hz`. 스케줄러가 catch-up을 하지
-  않으므로 **한 번 밀리면 실측 Hz = 루프 속도**가 된다.
-  - 이때 병목은 **telemetry가 아니다**: 플러그인에서 89.8Hz로 들어오고 기록된 행의 `packetId`가
-    전부 고유(중복 0%) — 게임 틱의 절반을 버리는 중이다. 범인은 이미지 경로(인코딩+디스크).
-  - `--image-hz`를 과하게 올리면(예 100) 이미지가 루프를 잡아 telemetry까지 더 끌어내린다.
-  - 50Hz를 확실히 지키려면 **이미지 캡처/저장을 별도 스레드+큐로 분리**해야 한다(미구현).
-    분리하면 현재 `dt≈0`(둘이 같은 반복에서 찍힘)이 최대 10ms로 벌어지지만 `merge_asof`가 처리한다.
-- **원격 데스크톱(RDP)에서는 ~33Hz**로 떨어진다. dxcam이 실제 GPU 출력 대신 RDP 화면을 잡기 때문.
+- **이 PC 의 스윗스팟은 40Hz.** 이미지 캡처가 한 장 ~23ms 라 50Hz(20ms 주기)는 여유가 거의 없어
+  순간 스톨에서 48-50Hz 로 흔들린다. **40Hz(25ms 주기)면 여유가 생겨 캡처가 목표를 정확히 낸다** →
+  균일 격자 export 에서 중복 0. 실측: `--image-hz 40` → 실측 40.2Hz, 격자 중복 0/빈칸 1.
+  `collect --capture-region 0,80,1920,945 --telemetry-hz 40 --image-hz 40`.
+- **원격 데스크톱(RDP)에서는 더 떨어진다.** dxcam이 실제 GPU 출력 대신 RDP 화면을 잡기 때문.
   **로컬(그 PC 앞)에서 수집할 것.**
 - **용량**: image 45Hz JPG(q95, 1920×945) ≈ 초당 32MB (686KB/장). 대량 수집 시 품질(q85 → 8.4ms,
   파일 ~30%↓) 조절.

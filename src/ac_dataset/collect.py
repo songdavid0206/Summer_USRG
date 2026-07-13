@@ -6,8 +6,8 @@ collect.py - 사람 주행 중 telemetry(state) / image 를 동시에 raw 기록
 수집이 끝나면 recorder.dataset_builder 로 camera/ ego_state/ opponent/ 폴더를 만든다.
 
   [사람이 AC 주행]
-        │  ego_server(UDP 2345) → ACTelemetrySource → TelemetryLogger.log(t, state, opponents)
-        │  ScreenCapture.grab()  → ImageLogger.log(t, image)   # 우리가 직접 화면 캡처
+        │  ego_server(UDP 2345) → ACTelemetrySource → TelemetryLogger.log(t, state)   # 메인 루프
+        │  ScreenCapture.grab() → ThreadedImageRecorder → 캡처/인코딩 별도 스레드      # 메인 루프 안 막음
         ▼
   telemetry_raw.parquet / image_index.parquet / (opponents_raw.parquet)   # raw 소스
         ▼  build_dataset()  (카메라 프레임 기준 정렬)
@@ -31,9 +31,10 @@ from pathlib import Path
 
 import math
 
-from .recorder import TelemetryLogger, ImageLogger, ACTelemetrySource
+from .recorder import TelemetryLogger, ACTelemetrySource
 from .recorder.ac_opponents import ACOpponentsSource
 from .recorder.screen_capture import ScreenCapture
+from .recorder.threaded_image import ThreadedImageRecorder
 from .recorder.dataset_builder import build_dataset
 
 
@@ -140,14 +141,17 @@ def collect(out_dir: str, run_id: str | None = None,
     screen = ScreenCapture(region=capture_region, backend=capture_backend)
     print(f"[capture] backend={screen.backend} region={capture_region or 'full monitor'}")
     tel_logger = TelemetryLogger(run_dir)
-    img_logger = ImageLogger(run_dir, image_ext=image_format)
-    print(f"[capture] image_format={img_logger.image_ext}")
 
     clock = Clock()
     tel_period = 1.0 / telemetry_hz
-    img_period = 1.0 / image_hz
     next_tel = 0.0
-    next_img = 0.0
+
+    # 이미지 캡처/인코딩은 별도 스레드로 분리한다. 인코딩(~17ms)이 메인 루프를 잡으면
+    # telemetry 까지 50Hz 를 못 지키기 때문(단일 루프 시 39~44Hz). 스레드 분리로 메인 루프는
+    # telemetry 만 → 게임이 주는 만큼(~50Hz) 유지. clock 을 공유해 timestamp 축을 맞춘다.
+    img_recorder = ThreadedImageRecorder(
+        run_dir, clock, screen, image_hz=image_hz, image_ext=image_format).start()
+    print(f"[capture] image_format={img_recorder.image_ext} (스레드 분리 캡처)")
 
     print(f"[collect] telemetry {telemetry_hz}Hz / image {image_hz}Hz. Ctrl+C 로 종료.")
     try:
@@ -162,18 +166,11 @@ def collect(out_dir: str, run_id: str | None = None,
                     tel_logger.log(now, state, opponents=opps)
                 next_tel += tel_period
 
-            # image: 자기 주기마다 화면 캡처 기록 (우리가 직접 캡처)
-            if now >= next_img:
-                image = screen.grab()
-                if image is not None:
-                    img_logger.log(now, image)
-                next_img += img_period
-
             if max_seconds is not None and now >= max_seconds:
                 break
 
-            # 다음 이벤트까지 살짝 쉬기 (busy-wait 방지)
-            sleep = min(next_tel, next_img) - clock.now()
+            # 다음 telemetry tick 까지 살짝 쉬기 (busy-wait 방지). 이미지는 별도 스레드가 처리.
+            sleep = next_tel - clock.now()
             if sleep > 0:
                 time.sleep(sleep)
 
@@ -182,7 +179,8 @@ def collect(out_dir: str, run_id: str | None = None,
     finally:
         elapsed = clock.now()
         tel_summary = tel_logger.flush()
-        img_summary = img_logger.flush()
+        # 이미지 스레드 정지 → 큐에 남은 프레임까지 저장 후 index flush.
+        img_summary = img_recorder.stop()
         # 실제 달성 Hz = 기록된 개수 / 총 수집시간
         tel_hz_actual = tel_summary.get("telemetry_rows", 0) / elapsed if elapsed > 0 else 0
         img_hz_actual = img_summary.get("image_frames", 0) / elapsed if elapsed > 0 else 0
@@ -197,7 +195,7 @@ def collect(out_dir: str, run_id: str | None = None,
             "telemetry_hz_actual": round(tel_hz_actual, 2),
             "image_hz_actual": round(img_hz_actual, 2),
             "elapsed_seconds": round(elapsed, 2),
-            "image_format": img_logger.image_ext,
+            "image_format": img_recorder.image_ext,
             "ego_server": f"{host}:{port}",
             "opponents_server": f"{host}:{opp_port}" if opp_src else None,
             "telemetry_recv_total": tel_src.received,

@@ -35,6 +35,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # ego_state 로 내보낼 때 빼는 보조 컬럼(디버깅/병합 잔재)
@@ -78,8 +79,18 @@ def build_dataset(run_dir: str | Path, tolerance: float = 0.05) -> dict:
     )
     merged["dt"] = (merged["t_img"] - merged["t_tel"]).abs()
 
+    n_frames_raw = len(merged)
+    # tolerance 안에 telemetry 를 못 찾은 카메라 프레임은 버린다(그 사진에 대응하는 차량 상태를
+    # 모르므로 NaN 으로 남기면 학습 불가·검증 실패). 주로 종료 순간 큐에 남은 꼬리 프레임 몇 장.
+    merged = merged[merged["t_tel"].notna()].reset_index(drop=True)
+    n_dropped = n_frames_raw - len(merged)
+    if n_dropped:
+        print(f"[build] telemetry 미매칭 {n_dropped}프레임 제외(tol {tolerance*1e3:.0f}ms 밖)")
+    # 프레임 번호를 남은 것 기준으로 0..N-1 재부여(폴더 파일명과 1:1 유지).
+    merged["frame"] = np.arange(len(merged))
+
     n_frames = len(merged)
-    n_matched = int(merged["t_tel"].notna().sum())
+    n_matched = n_frames
 
     # ------------------------------------------------------------------ camera
     cam_dir = run_dir / "camera"
