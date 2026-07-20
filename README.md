@@ -7,38 +7,67 @@
 > 참조 레포는 게임 데이터를 받아 RL을 하는 코드다. 우리가 만드는 건 그 학습 코드가
 > 아니라, 그 앞 단계인 **데이터셋 수집 시스템**이다. 모은 데이터는 이후 IL/RL에 쓴다.
 
-## 현재 상태 (2026-07-13)
+## 현재 상태 (2026-07-20)
 
-**게임 실주행 + AI 자동주행 수집 전 구간 동작.** 한 번의 `collect` 로 아래를 **지정한 Hz**로 취득:
-`카메라 이미지(JPG) + ego(자차) + opponent(상대차) + 조작값 라벨 + track(맵/레이싱라인)`.
-Assetto Corsa + sensors_par 플러그인(CSP 필요)에서 telemetry를, dxcam으로 화면을 캡처한다.
-이미지 캡처는 **별도 스레드**라 telemetry 가 목표 Hz 를 유지하고, 출력 파일명은 **균일 격자**(0,25,50...)다.
-`ac-validate` 로 데이터 무결성을 자동 검사한다. (이 PC 스윗스팟: 40Hz)
-후처리(`processed/`)에서 **리타이어/핏 프레임을 마스킹**해 학습에 쓸 프레임만 고를 수 있다.
+**게임 실주행·AI 자동주행에서 수집부터 검증용 export까지 전 구간이 동작한다.** 한 번의
+`collect`로 다음을 함께 취득한다.
 
-## 설계 핵심 — 방법 C (raw 따로 기록 → 오프라인 정렬)
+- dxcam 화면 이미지(JPG), ego 전체 telemetry, `steer/throttle/brake` 조작 라벨
+- 상대차 telemetry와 각 렌더 프레임의 상대차 full 6DoF pose·visual AABB
+- CSP가 실제로 렌더한 카메라의 position/forward/up/FOV
+- AC graphics packet·게임시간·랩 정보, 트랙 맵·레이싱 라인
 
-telemetry와 image는 **각자 주기로** 들어온다(현재 둘 다 목표 50Hz). 실시간으로 묶으면
-나중에 시각 어긋남을 검증/보정할 수 없다. 그래서 각자 timestamp를 달아 raw로 쌓아두고,
-수집이 끝난 뒤 **카메라 프레임 기준으로 정렬**한다.
+현재 권장 운용값은 **telemetry 100 Hz / image 40 Hz**다. 이미지 캡처·JPG 인코딩은 별도
+스레드에서 처리하고, 종료 후 25 ms 균일 격자로 export한다. `ac-validate`로 구조와 무결성을,
+별도 `ac_validation` 패키지의 `av-check`·`av-view`로 물리 일관성과 3D 재투영을 검사한다.
+
+새 run의 3D bbox는 **사진 속 차량을 검출하거나 픽셀에 맞춰 만든 결과가 아니다.** CSP가 한 번의
+`script.update`에서 제공한 카메라 pose와 차량 pose/AABB만으로 8개 월드 좌표 꼭짓점을 만들고
+카메라 intrinsic으로 투영한다. 이미지는 결과가 실제 렌더와 맞는지 사람이 독립적으로 확인하는
+검증 수단이다.
+
+### 대표 실측 run
+
+2026-07-20 Laguna Seca run(`20260720_171110`) 기준:
+
+| 항목 | 결과 |
+|---|---:|
+| 수집 시간 | 79.99 s |
+| telemetry | 7,999 ticks, 실측 100.0 Hz |
+| raw image | 3,235장, 실측 40.44 Hz |
+| 실제 카메라 pose | 3,235 / 3,235 (100%) |
+| same-render 차량 상태 | 3,235 / 3,235 (100%), 19,410행 |
+| build 유효 프레임 | 3,200 |
+| 40 Hz export | 3,197프레임, 중복 0 / 빈 격자 3 |
+
+## 설계 핵심 — 독립 raw 기록 → AC 게임시간/렌더 기준 오프라인 정렬
+
+telemetry와 image는 서로 다른 주기로 들어오므로 먼저 각각 원본을 보존하고, 수집 종료 후
+**카메라 프레임을 기준으로** 정렬한다. 새 run은 PC wall-clock의 가장 가까운 샘플을 단순히 고르는
+방식이 아니라 AC 게임시간을 공통 축으로 사용한다.
 
 ```
-[AC 주행 (사람 또는 AI)]  ── 같은 시계(Clock) ──►  각 스트림을 각자 timestamp 달아 raw 저장
-   telemetry(~50Hz) → telemetry_raw.parquet   (ego 전체 + steer/throttle/brake)  ← 플러그인 UDP 2345
-                      opponents_raw.parquet    (t, opp_id, ...)  ※ 상대 있을 때만 ← 플러그인 TCP 2346
-   image(~50Hz)     → image_index.parquet + camera/*.jpg                         ← 화면 캡처(dxcam)
-                                   │
-                                   ▼  dataset_builder (오프라인, merge_asof nearest)
-              camera/ + ego_state/ + opponent/opp_<id>/   ← 스트림별 폴더로 분리
-                                   +  track/  ← 트랙 맵 + 레이싱 라인 (fast_lane.ai 파싱)
+[Assetto Corsa / CSP]
+  sensors_par UDP 2345 ── ego telemetry 100 Hz ──► telemetry_raw.parquet
+  opponents TCP 2346 ─── opponent telemetry ─────► opponents_raw.parquet
+  AC Graphics SHM ─────── packetId/game time ────┐
+  CSP Lua bridge ───────── camera pose + cars ────┼─► image_index/render_car_state
+  dxcam ────────────────── image 40 Hz ───────────┘
+                                                    │
+                 game-time interpolation + packet/render relation matching
+                                                    ▼
+       camera/ + ego_state/ + opponent/ + track/ + processed/ + export
 ```
 
-- **정렬 기준 = 카메라 프레임.** 이미지 한 장마다 시간이 가장 가까운 telemetry tick을 붙인다
-  (`merge_asof` nearest, tolerance 50ms). **모든 프레임을 유지**하므로
-  `camera/{i}.jpg` ↔ `ego_state` 행 i ↔ 각 `opp_<id>` 행 i 가 **항상 1:1로 대응**하고
-  세 폴더의 행 개수가 정확히 같다.
-- **이미지는 우리가 직접 화면 캡처**(dxcam→mss 폴백). 캡처/인코딩은 별도 스레드(같은 Clock 공유)라
-  메인 루프의 telemetry 가 이미지 부하에 안 막힌다. 정렬 dt 는 중앙 ~1.5ms(스레드별 시각차). JPG 저장.
+- **공통 시간축:** 이미지의 `game_time_ms`와 telemetry의 `timestamp_ac`를 랩 누적시간으로
+  바꾼 뒤 선형 보간한다. 각도는 `sin/cos`로 보간해 ±π 경계 점프를 피한다.
+- **같은 렌더 확인:** AC Graphics `packetId`와 CSP `render_frame` 사이의 안정적인 선형 관계를
+  run 중 학습한다. 게임시간 후보 중 관계 오차가 가장 작은 CSP slot을 선택하고
+  `cam_packet_render_error` 등 진단값을 저장한다.
+- **프레임 정책:** 허용 오차 밖의 미매칭 이미지는 제외한 뒤 프레임을 다시 0부터 번호 매긴다.
+  따라서 최종 `camera/{i}.jpg`, `ego_state`의 i행, 각 `opp_<id>`의 i행은 항상 1:1이다.
+- **구 run 호환:** AC 게임시간이 없는 예전 run만 wall-clock `merge_asof(nearest)`로 fallback한다.
+- **캡처 분리:** dxcam→mss 폴백과 JPG 인코딩은 별도 스레드라 100 Hz telemetry 수집을 막지 않는다.
 - **action(정답 라벨)은 제어를 내보내지 않고 telemetry에서 읽는다.** 주행을 방해하지
   않도록 state의 `steerAngle/accStatus/brakeStatus`를 canonical `steer/throttle/brake`로 라벨링.
   (AI 자동주행 시엔 AI의 조작값이 그대로 라벨 = IL 전문가 데이터)
@@ -52,7 +81,8 @@ telemetry와 image는 **각자 주기로** 들어온다(현재 둘 다 목표 50
 dataset/<run_id>/                     # run_id = 수집 시각 (YYYYMMDD_HHMMSS)
     camera/
         000000.jpg, 000001.jpg, ...   # 프레임별 이미지 (파일명 = frame 번호, JPG q95)
-        camera_index.parquet / .csv   # frame, t_img, image_path
+        camera_index.parquet / .csv   # 이미지·게임시간·실제 렌더 카메라 pose/FOV·동기 진단값
+        render_car_state.parquet/.csv # 같은 렌더 tick의 차량 full 6DoF pose + visual AABB
     ego_state/
         ego_state.parquet / .csv      # 프레임당 1행: 자차 state 전체 + steer/throttle/brake
     opponent/
@@ -69,6 +99,7 @@ dataset/<run_id>/                     # run_id = 수집 시각 (YYYYMMDD_HHMMSS)
     image_index.parquet               # frame ↔ t ↔ image_path
     telemetry_raw.parquet             # tick별 ego 전체 + steer/throttle/brake (고주파 원본)
     opponents_raw.parquet             # (t, opp_id, rel_x, rel_y, ...)  ※ optional
+    render_car_state.parquet          # CSP ring에서 받은 렌더 차량 상태 원본
     meta.json                         # 수집 설정/요약 (실측 Hz 포함)
 ```
 
@@ -76,6 +107,27 @@ dataset/<run_id>/                     # run_id = 수집 시각 (YYYYMMDD_HHMMSS)
 - raw 3종(`image_index`, `telemetry_raw`, `opponents_raw`)만 있으면 언제든 재정렬 가능: `ac-build dataset/<run_id>`
 - 정렬된 폴더(camera/ego_state/opponent)는 결국 **image Hz로 캡핑**된다. telemetry가 더 높아도
   ego_state는 이미지에 맞춰진 rate이며, **고주파 원본은 `telemetry_raw.parquet`에 그대로 보존**된다.
+
+---
+
+## 카메라·same-render 차량 필드
+
+`camera/camera_index.parquet`에는 일반 이미지 인덱스 외에 다음 렌더 진단값이 저장된다.
+
+| 필드 | 의미 |
+|---|---|
+| `game_time_ms`, `graphics_packet`, `completed_laps` | 이미지 캡처 시 AC Graphics 공유메모리 상태 |
+| `cam_pos_x/y/z` | CSP가 제공한 실제 렌더 카메라 월드 위치(m) |
+| `cam_forward_x/y/z`, `cam_up_x/y/z` | 실제 카메라 전방·상방 단위벡터(extrinsic 회전) |
+| `cam_fov_deg` | 해당 렌더 프레임의 수직 FOV. 해상도와 함께 intrinsic 계산에 사용 |
+| `cam_render_frame`, `cam_game_time_ms` | 선택된 CSP 렌더 slot의 프레임·게임시간 |
+| `cam_packet_render_error` | 학습된 graphics-packet/render-frame 관계에 대한 잔차 |
+| `cam_pose_game_delta_ms` | 이미지와 CSP slot 사이 게임시간 오차 |
+
+`camera/render_car_state.parquet`는 `frame`, `car_id`별로 같은 CSP callback에서 읽은 차량
+`position/look/up`과 visual AABB 최소·최대점을 담는다. 좌표는 저장 시 AC의 축을 데이터셋 표준
+`(x, y, z) = (AC z, AC x, AC y)`로 변환한다. 카메라와 차량이 같은 렌더 상태에서 나오므로
+telemetry 서버 지연이나 속도 기반 외삽으로 bbox를 움직이지 않는다.
 
 ---
 
@@ -295,9 +347,9 @@ parquet 대신 **프레임 하나당 파일 하나**로 푼 포맷. `collect` �
 
 ```
 dataset/<run_id>_<track>_<hz>hz/
-    CAMERA/0.jpg  20.jpg  40.jpg  60.jpg ...   # 50Hz → 20ms 간격 (40Hz면 0,25,50,75...)
-    EGO_INFO/0.txt  20.txt ...          # 자차 상태 (key: values)
-    OBJECT_INFO/0.txt  20.txt ...       # 그 프레임에 '보이는' 상대차만 (헤더 + 차당 1행)
+    CAMERA/0.jpg  25.jpg  50.jpg  75.jpg ...   # 권장 40Hz → 25ms 간격
+    EGO_INFO/0.txt  25.txt ...          # 자차 상태 (key: values)
+    OBJECT_INFO/0.txt  25.txt ...       # 그 프레임에 '보이는' 상대차만 (헤더 + 차당 1행)
     export_info.json                    # 화각/차종/격자 Hz/프레임수 등 요약
 ```
 
@@ -320,9 +372,10 @@ AC 는 "이 차가 화면에 보이는가"를 알려주지 않는다. 플러그�
 2. `|atan2(opp_lateral, opp_forward)| <= 수평FOV/2`
 3. `retired == False` (핏으로 회수되지 않음)
 
-수평 FOV 는 게임 설정에서 유도한다: `cfg/camera_onboard.ini` 의 `FOV`(수직) + `cfg/video.ini` 의
-렌더 해상도 → `hfov = 2·atan(tan(vfov/2)·(W/H))`. 기본 세팅(FOV 56, 1920×1080)에서 **86.8°, f≈1016px**.
-실제 이미지에 상대차를 투영해 검증했다(24~124m, 방위각 최대 41°에서 전부 차체에 적중).
+수평 FOV는 `--onboard-camera`가 가리키는 차종 `cameras.ini`의 수직 FOV와 실제 캡처 종횡비에서
+`hfov = 2·atan(tan(vfov/2)·(W/H))`로 구한다. 현재 CAMERA_0(FOV 60°), 1920×945 캡처에서는
+**hfov 91.49°, f≈935 px**다. 새 run의 정밀 3D bbox 검증에서는 이 고정 extrinsic을 쓰지 않고
+프레임별 CSP actual pose/FOV를 사용한다.
 
 - **차폐(occlusion)는 처리하지 않는다.** 앞차 뒤에 완전히 가려진 차도 '보임'으로 들어간다.
 - 카메라가 차 원점에 있다고 근사한다(실제로는 약간의 오프셋. 먼 거리에선 무시 가능).
@@ -411,6 +464,7 @@ Summer_USRG/
         processed_builder.py      # raw → processed/ (E2E/IL용 선별·가공 피처 + 유효 마스크)
         export_frames.py          # processed → CAMERA/EGO_INFO/OBJECT_INFO (균일격자 프레임별 txt)
         acd.py                    # data.acd 복호화 → 차량 제원(STEER_LOCK, 충돌박스 치수)
+        ac_shmem.py               # AC Graphics SHM + CSP v2 렌더 ring 안전 읽기
         validate.py               # 수집 run 자동 검증(ac-validate) → validation.json
         view.py                   # parquet 미리보기/CSV 뷰어
         recorder/
@@ -420,8 +474,11 @@ Summer_USRG/
             screen_capture.py     # 화면 캡처 (dxcam 우선 → mss 폴백, region 지정 가능)
             image_logger.py       # 캡처 프레임을 camera/ 에 JPG + index로 저장
             threaded_image.py     # 이미지 캡처/인코딩 스레드 분리(telemetry 부하 격리)
+            sync.py               # 고정 주기 실행·공통 monotonic clock 유틸리티
             dataset_builder.py    # raw → camera/ ego_state/ opponent/ 정렬·분리(미매칭 프레임 드롭)
+    csp_apps/ac_camera_pose_bridge/ # 실제 렌더 카메라·차량 상태를 공유메모리에 쓰는 Lua 앱
     tests/test_offline.py         # 게임 없이 서로 다른 주기 raw 생성 → 정렬 검증
+    tests/test_camera_pose.py     # 좌표축·렌더 packet 관계·카메라 pose 단위 테스트
     dataset/                      # 수집 결과 (git 미추적)
 ```
 
@@ -451,8 +508,9 @@ F1/F6/F5/트랙 카메라 전환은 프레임별 `cam_mode`, `cam_drivable_mode`
 `cam_focused_car`에도 함께 기록된다.
 
 브리지 v2는 같은 렌더 callback에서 모든 차량의 `position/look/up`, visual AABB와 상태 timestamp도
-기록한다. 정렬 후 `camera/render_car_state.parquet`에 저장되며, 카메라와 상대차가 동일 렌더 tick을
-사용하므로 상대차 서버 지연이나 yaw-only 근사를 3D bbox 투영에 사용하지 않는다.
+기록한다. 128-slot ring buffer(슬롯당 최대 32대)와 odd/even sequence를 사용해 Lua가 쓰는 도중 Python이
+반쪽짜리 프레임을 읽지 않게 한다. 정렬 후 `camera/render_car_state.parquet`에 저장되며, 카메라와
+상대차가 동일 렌더 tick을 사용하므로 상대차 서버 지연이나 yaw-only 근사를 3D bbox에 사용하지 않는다.
 
 ### ⚠️ 게임 플러그인도 수정해야 한다 (레포 밖)
 
@@ -476,13 +534,16 @@ git 으로 추적되지 않으므로, 게임을 재설치하거나 플러그인�
 
 **실제 수집 (AC + 플러그인 + CSP 실행 후, 트랙에 진입한 상태)**
 ```bash
-collect --capture-region 0,80,1920,945   # 기본 telemetry 50Hz / image 50Hz(JPG), 지정 영역만 캡처
+collect --capture-region 0,80,1920,945 --telemetry-hz 100 --image-hz 40 --onboard-camera 0
 # 주행(사람 또는 AI) → Alt+Tab 으로 터미널 이동 → Ctrl+C 로 종료 (게임이 키보드를 잡으므로 Alt+Tab 필수)
-# 종료 시 자동으로 camera/ ego_state/ opponent/ track/ 폴더 + parquet + csv 생성
+# 종료 시 정렬 → track → processed → 40Hz export까지 자동 실행
 ```
 - **HUD는 게임에서 꺼두되, `--capture-region`으로 남는 UI 요소(상단 배너/하단 스트립 등)까지 잘라낸다.**
   값 `L,T,W,H`는 게임 해상도/화면에 맞게 조정(예: 1920×1080에서 위 80px·아래 55px 잘라내면 `0,80,1920,945`).
 - `--telemetry-hz`, `--image-hz` : 목표 주파수(기본 둘 다 50). `--image-format jpg|png`.
+- `--onboard-camera 0`은 차종·FOV metadata와 구 run fallback용 CAMERA_0 지정이다. **새 run의 실제
+  extrinsic은 CSP가 매 프레임 직접 기록**하므로 수집 중 F1/F5/F6 등으로 시점을 바꾸어도 새 pose가
+  저장된다. 단 학습 데이터의 시점 일관성이 필요하면 한 카메라 모드를 유지해야 한다.
 - **AI 자동주행 수집**: 트랙 주행 중 게임 창에서 `Ctrl+C` → AC 내장 AI가 대신 운전. 그 상태로 `collect` 하면
   AI 조작값이 라벨로 저장돼 IL 전문가 데이터가 된다. (게임 Ctrl+C = AI토글, 터미널 Ctrl+C = 수집종료)
 
@@ -499,7 +560,7 @@ ac-track   dataset/<run_id>          # 주행 좌표로 트랙 자동 식별 →
 ac-process dataset/<run_id>          # raw → processed/ (E2E/IL용 선별·가공 피처 + 유효 마스크)
 ac-export  dataset/<run_id>          # processed → CAMERA/EGO_INFO/OBJECT_INFO (프레임별 txt)
 #   --grid-hz 40      파일명 균일 격자 Hz (기본: 수집 목표 Hz). 중복 뜨면 낮춰 재실행
-#   --hfov 86.8       화각 직접 지정 (기본: 게임 설정에서 읽음)
+#   --hfov 91.49      화각 수동 override (기본: 차종 CAMERA_N 설정에서 읽음)
 #   --max-range 150   이 거리보다 먼 상대차 제외
 #   --all-frames      자차가 핏에 있는 프레임도 포함
 ```
@@ -534,12 +595,12 @@ python tests/test_offline.py
 `image_hz_actual` 에 저장된다.
 
 ```bash
-collect --capture-region 0,80,1920,945 --telemetry-hz 20 --image-hz 20   # 20Hz 로 취득
+collect --capture-region 0,80,1920,945 --telemetry-hz 100 --image-hz 40 --onboard-camera 0
 ```
 
-> **telemetry 는 이미지에서 분리돼 있다.** 이미지 캡처/인코딩은 별도 스레드가 처리하므로
-> (아래 참조), 메인 루프는 telemetry 만 돌려 게임이 주는 만큼(~50-70Hz)을 유지한다. 이미지가
-> 무거워도 telemetry 를 끌어내리지 않는다.
+> **telemetry는 이미지에서 분리돼 있다.** 이미지 캡처/인코딩은 별도 스레드가 처리하므로
+> 현재 수정된 플러그인에서 ego 100 Hz와 image 40 Hz를 동시에 유지한다. 두 rate가 달라도
+> AC 게임시간 보간으로 이미지 시각의 ego state를 만든다.
 >
 > **최종 출력 파일명은 균일 격자다.** 실측 캡처는 미세하게 흔들리지만(std ~2ms), `ac-export` 가
 > 목표 Hz 의 정확한 격자로 리샘플한다(위 "프레임별 txt" 참조). 그래서 지정한 Hz 가 파일명에
@@ -552,24 +613,22 @@ collect --capture-region 0,80,1920,945 --telemetry-hz 20 --image-hz 20   # 20Hz 
 - **캡처 스레드**: `image_hz` 주기로 `screen.grab()` 만 하고 (t, frame) 을 큐에 넣는다.
 - **인코더 워커**: 큐에서 꺼내 JPG 인코딩+저장(순서 유지, 프레임 유실 없음).
 
-dxcam grab 과 PIL 인코딩은 네이티브 호출 중 GIL 을 놓아 실제로 병렬 실행된다. 효과(오프라인 실측,
-1080p): 단일 루프 telemetry 21.7Hz → **스레드 분리 50.0Hz**. 부작용으로 정렬 `dt` 가 0 이 아니게
-되지만(각 스트림이 자기 시각에 찍힘) 중앙 ~1.5ms 로 작고, 이게 오히려 실제 시간차를 정직하게 반영한다
-(기존 dt=0 은 "가장 최근 telemetry 를 이미지 시각으로 베껴 적은" 눈속임이었다 — 값은 최대 ~14ms 과거).
-tolerance(50ms) 안에 매칭 안 되는 프레임(주로 종료 직후 큐 잔여)은 `build_dataset` 이 버린다.
+dxcam grab과 PIL 인코딩은 네이티브 호출 중 GIL을 놓아 실제로 병렬 실행된다. 각 스트림은 자신의
+wall-clock과 AC 게임시간을 모두 남긴다. tolerance(기본 50 ms) 안에 게임시간으로 대응할 telemetry가
+없는 프레임(주로 종료 직후 큐 잔여)은 `build_dataset`이 버린다.
 
 각 스트림의 실제 한계:
 
 | 스트림 | 실측 한계 | 무엇이 막나 |
 |---|---|---|
-| **telemetry(ego)** | 목표 Hz 유지 (스레드 분리) | 플러그인은 ~70-90Hz로 보내준다. 메인 루프는 telemetry 만 하므로 목표(예 40/50)를 안정적으로 낸다 |
+| **telemetry(ego)** | 100.0Hz | 수정된 sensors_par UDP 송신과 이미지 스레드 분리 |
 | **image** | ~48-50Hz | 캡처(grab ~6ms) + JPG 인코딩·저장(~17ms) = ~23ms. 파이프라인으로 겹쳐 ~50Hz 상한. 순간 스톨이 평균을 조금 깎음 |
-| **opponents** | ~50Hz | 플러그인 `sensors_par.py`의 opponents 송신 `time.sleep()` 값. 낮출수록↑(0.008≈50Hz), 단 AC 구형 파이썬 불안정 위험 |
+| **opponents** | 약 50Hz | 플러그인 `sensors_par.py`의 opponents 송신 주기. bbox는 이 스트림 대신 CSP same-render 상태 사용 |
 
 - **이 PC 의 스윗스팟은 40Hz.** 이미지 캡처가 한 장 ~23ms 라 50Hz(20ms 주기)는 여유가 거의 없어
   순간 스톨에서 48-50Hz 로 흔들린다. **40Hz(25ms 주기)면 여유가 생겨 캡처가 목표를 정확히 낸다** →
-  균일 격자 export 에서 중복 0. 실측: `--image-hz 40` → 실측 40.2Hz, 격자 중복 0/빈칸 1.
-  `collect --capture-region 0,80,1920,945 --telemetry-hz 40 --image-hz 40`.
+  균일 격자 export에서 중복 0. 최신 실측은 image 40.44Hz, telemetry 100.0Hz, 3,197개 export에서
+  중복 0/캡처 스톨 빈칸 3이다.
 - **원격 데스크톱(RDP)에서는 더 떨어진다.** dxcam이 실제 GPU 출력 대신 RDP 화면을 잡기 때문.
   **로컬(그 PC 앞)에서 수집할 것.**
 - **용량**: image 45Hz JPG(q95, 1920×945) ≈ 초당 32MB (686KB/장). 대량 수집 시 품질(q85 → 8.4ms,
