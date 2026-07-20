@@ -96,15 +96,36 @@ def _read_ini(path: Path) -> configparser.ConfigParser:
     return cp
 
 
-def read_camera_hfov() -> float:
-    """수평 FOV(라디안). AC 의 FOV 설정은 '수직'이라 렌더 종횡비로 변환한다."""
+def read_camera_hfov(model: str | None = None, camera_index: int | None = None) -> float:
+    """수평 FOV(라디안). AC 의 FOV 설정은 '수직'이라 렌더 종횡비로 변환한다.
+
+    ⚠️ FOV 는 **카메라마다 다르다**(실측 검증):
+      - F6 온보드캠(cameras.ini 의 CAMERA_N)은 **그 카메라 자체 FOV**(예: 60)로 렌더된다.
+        게임 설정(Video>View)의 온보드 FOV 슬라이더는 여기에 **안 먹는다**.
+      - F1 콕핏/DASH 뷰만 게임 설정 FOV(camera_onboard.ini)를 따른다.
+    model/camera_index 를 주면 cameras.ini 의 해당 카메라 FOV 를 우선 쓰고, 없으면 게임 설정.
+    (56 을 잘못 쓰면 f 가 8% 커져 화면 가장자리·원거리 물체가 주점 바깥으로 밀린다.)
+    """
     cfg = _ac_cfg_dir()
-    vfov_deg = 56.0
+    vfov_deg = None
     w, h = 1920.0, 1080.0
-    try:
-        vfov_deg = float(_read_ini(cfg / "camera_onboard.ini")["HEADER"]["FOV"])
-    except Exception:
-        pass
+    if model is not None and camera_index is not None:
+        try:
+            from .acd import read_onboard_cameras_by_model
+            cams = read_onboard_cameras_by_model(model) or []
+            if 0 <= camera_index < len(cams) and cams[camera_index].get("fov"):
+                vfov_deg = float(cams[camera_index]["fov"])
+        except Exception:
+            pass
+    if vfov_deg is None:
+        vfov_deg = 56.0
+        try:
+            co = _read_ini(cfg / "camera_onboard.ini")
+            # FOV 는 파일 버전에 따라 [MODE] 또는 [HEADER] 에 있다.
+            sec = "MODE" if co.has_option("MODE", "FOV") else "HEADER"
+            vfov_deg = float(co[sec]["FOV"])
+        except Exception:
+            pass
     try:
         vid = _read_ini(cfg / "video.ini")["VIDEO"]
         w, h = float(vid["WIDTH"]), float(vid["HEIGHT"])
@@ -209,9 +230,19 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
     ego_raw = pd.read_parquet(run_dir / "ego_state" / "ego_state.parquet")
     cam = pd.read_parquet(run_dir / "camera" / "camera_index.parquet")
 
-    hfov_rad = math.radians(hfov) if hfov is not None else read_camera_hfov()
-    half_fov = hfov_rad / 2.0
     models = read_car_models()
+    # 화각: 수집에 쓴 온보드캠(meta.onboard_camera_index)의 cameras.ini FOV 우선.
+    # (F6 캠은 자체 FOV 로 렌더 — 게임 설정 FOV 를 쓰면 원거리 물체 판정이 어긋난다)
+    _cam_idx = None
+    try:
+        import json as _json
+        _meta = _json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+        _cam_idx = _meta.get("onboard_camera_index")
+    except Exception:
+        pass
+    hfov_rad = (math.radians(hfov) if hfov is not None
+                else read_camera_hfov(models.get(0), _cam_idx))
+    half_fov = hfov_rad / 2.0
     dims, dim_reliable = _load_dimensions(models)   # car_id -> (L, W, H), data.acd 에서
     steer_lock = _load_steer_lock(models)           # 도. steerNorm*steer_lock = 조향각(도)
     if dim_reliable and not all(dim_reliable.values()):

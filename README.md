@@ -436,6 +436,24 @@ pip install -e ".[capture]" # (선택) Windows에서 더 빠른 dxcam 캡처 백
 설치하면 아래 명령들을 **어느 폴더에서든** 쓸 수 있다:
 `collect`, `ac-build`, `ac-view`, `ac-track`, `ac-process`, `ac-export`.
 
+3D bbox 검증용 실제 렌더 카메라 pose를 기록하려면 CSP Lua 브리지도 설치한다(폴더째 복사):
+
+```text
+csp_apps/ac_camera_pose_bridge
+  → <Assetto Corsa>/apps/lua/ac_camera_pose_bridge
+```
+
+게임 내 CSP 앱 목록에서 **AC Dataset Camera Pose**를 활성화한다. `collect` 시작 로그에
+`CSP 실제 카메라 pose = 연결`이 떠야 하며, 이후 `camera_index.parquet`에는 각 이미지의
+`cam_pos_*`, `cam_forward_*`, `cam_up_*`, `cam_fov_deg`가 저장된다. 이 값은 CSP 렌더 상태에서
+직접 오며 이미지 픽셀을 읽거나 bbox를 이미지에 맞춰 보정하지 않는다.
+F1/F6/F5/트랙 카메라 전환은 프레임별 `cam_mode`, `cam_drivable_mode`, `cam_car_index`,
+`cam_focused_car`에도 함께 기록된다.
+
+브리지 v2는 같은 렌더 callback에서 모든 차량의 `position/look/up`, visual AABB와 상태 timestamp도
+기록한다. 정렬 후 `camera/render_car_state.parquet`에 저장되며, 카메라와 상대차가 동일 렌더 tick을
+사용하므로 상대차 서버 지연이나 yaw-only 근사를 3D bbox 투영에 사용하지 않는다.
+
 ### ⚠️ 게임 플러그인도 수정해야 한다 (레포 밖)
 
 이 파이프라인은 `sensors_par` 플러그인의 **수정된 버전**을 전제로 한다. 수정 파일은 게임 폴더에 있어

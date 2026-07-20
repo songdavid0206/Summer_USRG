@@ -131,13 +131,15 @@ def _ini_get(text: str, section: str, key: str) -> str | None:
 
 
 def _floats(s: str) -> list[float]:
-    return [float(x) for x in re.findall(r"-?\d+\.?\d*", s)]
+    # 과학적 표기(예: 5.9837e-008) 포함. cameras.ini forward/up 벡터에 필수.
+    return [float(x) for x in re.findall(r"-?\d+\.?\d*(?:[eE][-+]?\d+)?", s)]
 
 
 def read_car_specs(car_dir: str | Path) -> dict:
     """차량 제원을 게임 파일에서 직접 읽는다.
 
-    반환: {steer_lock(도), dimension=(length,width,height)[m], mass, source}
+    반환: {steer_lock(도), dimension=(length,width,height)[m],
+           bbox_center=(forward,left,up)[m], mass, source}
     dimension 은 colliders.ini 박스들의 합집합 bounding box.
       축: SIZE/CENTRE = (x=좌우/폭, y=상하/높이, z=앞뒤/길이).
     """
@@ -157,6 +159,7 @@ def read_car_specs(car_dir: str | Path) -> dict:
         mass = float(_floats(v)[0])
 
     dimension = None
+    bbox_center = None
     lo = [1e9, 1e9, 1e9]
     hi = [-1e9, -1e9, -1e9]
     cur: dict[str, list[float]] = {}
@@ -183,6 +186,9 @@ def read_car_specs(car_dir: str | Path) -> dict:
     if got:
         # (length=z, width=x, height=y)
         dimension = (hi[2] - lo[2], hi[0] - lo[0], hi[1] - lo[1])
+        bbox_center = ((lo[2] + hi[2]) / 2,
+                       (lo[0] + hi[0]) / 2,
+                       (lo[1] + hi[1]) / 2)
         # AC 의 collider 는 실제 차체 외곽이 아니라 '물리 충돌 판'이다. 레이스카는 롤후프·윙까지
         # 여러 박스로 세밀해 높이가 잡히지만, 로드카는 바닥 판 하나뿐이라 높이가 ~0.1m 로 무의미.
         # 길이/폭은 대체로 신뢰할 만하나 높이는 못 믿는 경우가 많다.
@@ -192,6 +198,7 @@ def read_car_specs(car_dir: str | Path) -> dict:
         "car_model": car_dir.name,
         "steer_lock": steer_lock,
         "dimension": dimension,           # (length, width, height) m — collider bbox
+        "bbox_center": bbox_center,        # (forward, left, up) m from car origin
         "dimension_reliable": dimension_reliable,   # 높이가 물리 판 두께면 False
         "mass": mass,
         "source": "data.acd (car.ini + colliders.ini)",
@@ -210,6 +217,64 @@ def read_car_specs_by_model(model: str, cars_dir: str | Path | None = None) -> d
         return None
     try:
         return read_car_specs(car_dir)
+    except Exception:
+        return None
+
+
+def read_onboard_cameras(car_dir: str | Path) -> list[dict]:
+    """<car_dir>/data.acd 의 cameras.ini 에서 온보드 카메라들을 읽는다.
+
+    각 [CAMERA_N] 은 차체 로컬 좌표(x=우, y=상, z=전방) 기준:
+      position (m), forward, up (단위벡터), fov(수직, 도).
+    반환: 인덱스 순 list[dict{idx, position, forward, up, fov}].
+    AC 온보드(F1 사이클) 관례상 대체로 CAMERA_0=콕핏, CAMERA_1=후드/보닛 순.
+    """
+    car_dir = Path(car_dir)
+    files = unpack_acd(car_dir)
+    txt = files.get("cameras.ini", "")
+    cams = []
+    idx = 0
+    while True:
+        sec = f"CAMERA_{idx}"
+        pos = _ini_get(txt, sec, "POSITION")
+        if pos is None:
+            break
+        fwd = _ini_get(txt, sec, "FORWARD") or "0,0,1"
+        up = _ini_get(txt, sec, "UP") or "0,1,0"
+        fov = _ini_get(txt, sec, "FOV")
+        cams.append({
+            "idx": idx,
+            "name": f"CAMERA_{idx}",
+            "position": _floats(pos)[:3],
+            "forward": _floats(fwd)[:3],
+            "up": _floats(up)[:3],
+            "fov": float(_floats(fov)[0]) if fov else None,
+        })
+        idx += 1
+    # 콕핏/대시 뷰는 CAMERA_N 이 아니라 dash_cam.ini 에 있다. forward/up 이 없으므로 수평으로
+    # 둔다(온보드 카메라를 'lock to horizon' 으로 캡처하면 수평이 맞다). 목록 끝에 추가.
+    dtxt = files.get("dash_cam.ini", "")
+    dpos = _ini_get(dtxt, "DASH_CAM", "POS")
+    if dpos is not None:
+        cams.append({
+            "idx": idx,
+            "name": "DASH",
+            "position": _floats(dpos)[:3],
+            "forward": [0.0, 0.0, 1.0],
+            "up": [0.0, 1.0, 0.0],
+            "fov": None,
+        })
+    return cams
+
+
+def read_onboard_cameras_by_model(model: str, cars_dir: str | Path | None = None) -> list[dict] | None:
+    """차종 이름으로 온보드 카메라 목록 읽기. 폴더 없거나 실패하면 None."""
+    base = Path(cars_dir) if cars_dir else _default_cars_dir()
+    car_dir = base / model
+    if not (car_dir / "data.acd").exists():
+        return None
+    try:
+        return read_onboard_cameras(car_dir)
     except Exception:
         return None
 

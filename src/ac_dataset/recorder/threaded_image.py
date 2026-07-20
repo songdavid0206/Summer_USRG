@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..ac_shmem import ACCameraPoseShm, ACGraphicsShm
 from .image_logger import ImageLogger
 
 
@@ -47,12 +48,19 @@ class ThreadedImageRecorder:
         self._enc_thread: threading.Thread | None = None
         self.captured = 0            # grab 성공 수
         self.max_queue_seen = 0      # 인코더가 얼마나 밀렸는지 진단용
+        # AC Graphics 공유메모리: grab 순간의 '화면에 그려진 프레임 게임시간'을 이미지에 같이 기록해
+        # 이미지↔telemetry 를 게임시계로 페어링(시간동기, 방법 a). 게임 미실행이면 available=False.
+        self.gshm = ACGraphicsShm()
+        self.camera_shm = ACCameraPoseShm()
 
     @property
     def image_ext(self) -> str:
         return self.logger.image_ext
 
     def start(self) -> "ThreadedImageRecorder":
+        print(f"[capture] AC Graphics 공유메모리 = {'연결(게임시간 기록 ON)' if self.gshm.available else '없음(게임시간 미기록 — 게임 실행/세션 진입 확인)'}")
+        print(f"[capture] CSP 실제 카메라 pose = "
+              f"{'연결(프레임별 3D 투영 ON)' if self.camera_shm.available else '없음 — ac_camera_pose_bridge 설치/활성화 필요'}")
         self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._enc_thread = threading.Thread(target=self._encode_loop, daemon=True)
         self._enc_thread.start()
@@ -66,8 +74,13 @@ class ThreadedImageRecorder:
             if now >= next_img:
                 frame = self.screen.grab()
                 if frame is not None:
+                    # grab 직후 즉시 '지금 그려진 프레임의 게임시간'을 읽는다(마이크로초, 큐잉 전).
+                    g_pid, g_time, g_laps = self.gshm.read_full()
                     # dxcam 은 내부 버퍼를 재사용할 수 있어 copy 로 스냅샷을 뜬다(인코더가 늦게 읽어도 안전).
-                    self._q.put((now, np.array(frame, copy=True)))  # 큐 가득이면 여기서 블록
+                    # CSP Lua update가 현재 present 직후 아직 안 끝났을 수 있으므로 pose는 여기서
+                    # 읽지 않는다. 인코더가 몇 ms 뒤 링 버퍼의 과거 game time을 조회한다.
+                    self._q.put((now, g_pid, g_time, g_laps,
+                                 np.array(frame, copy=True)))  # 큐 가득이면 블록
                     self.captured += 1
                     self.max_queue_seen = max(self.max_queue_seen, self._q.qsize())
                 next_img += self.period
@@ -80,8 +93,10 @@ class ThreadedImageRecorder:
             item = self._q.get()
             if item is None:        # 종료 sentinel
                 break
-            t, frame = item
-            self.logger.log(t, frame)
+            t, g_pid, g_time, g_laps, frame = item
+            camera_pose = self.camera_shm.read(g_time, g_laps, g_pid)
+            self.logger.log(t, frame, graphics_packet=g_pid, game_time_ms=g_time,
+                            completed_laps=g_laps, camera_pose=camera_pose)
 
     def stop(self) -> dict:
         """캡처 중단 → 큐 소진(남은 프레임 전부 저장) → index flush. 요약 반환."""
@@ -91,6 +106,8 @@ class ThreadedImageRecorder:
         self._q.put(None)           # 인코더에게 '남은 것 다 처리하고 종료'
         if self._enc_thread:
             self._enc_thread.join()
+        self.gshm.close()
+        self.camera_shm.close()
         summary = self.logger.flush()
         summary["image_captured"] = self.captured
         summary["image_max_queue"] = self.max_queue_seen

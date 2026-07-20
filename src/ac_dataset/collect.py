@@ -38,6 +38,41 @@ from .recorder.threaded_image import ThreadedImageRecorder
 from .recorder.dataset_builder import build_dataset
 
 
+def _camera_cfg_snapshot() -> dict:
+    """게임 카메라 설정을 meta 에 스냅샷 — 어떤 온보드 뷰·FOV·흔들림으로 캡처했는지 기록.
+
+    검증툴(av-view)이 이 값으로 3D bbox 투영 카메라를 **자동 선택**한다:
+      camera_mode(camera_manager.ini LAST_CAMERA MODE) / camera_drivable_mode(DRIVABLE_MODE
+      0=Chase 1=Chase2 2=Bonnet 3=Bumper 4=Dash) / onboard_fov_deg(수직) /
+      camera_gforce_mix·camera_shake_scale(0 이 아니면 카메라가 흔들려 박스 어긋남).
+    주의: LAST_CAMERA 는 게임이 갱신하는 '마지막 사용' 값 — 수집 중 뷰를 바꾸면 어긋날 수 있음.
+    """
+    out = {}
+    try:
+        from .export_frames import _ac_cfg_dir, _read_ini
+        cm = _read_ini(_ac_cfg_dir() / "camera_manager.ini")["LAST_CAMERA"]
+        out["camera_mode"] = int(cm["MODE"])
+        out["camera_drivable_mode"] = int(cm["DRIVABLE_MODE"])
+    except Exception:
+        pass
+    try:
+        from .export_frames import _ac_cfg_dir, _read_ini
+        co = _read_ini(_ac_cfg_dir() / "camera_onboard.ini")
+        sec = "MODE" if co.has_option("MODE", "FOV") else "HEADER"
+        out["onboard_fov_deg"] = float(co[sec]["FOV"])
+        # IS_WORLD_ALIGNED=1 (Lock onboard camera to horizon): 카메라가 차체 roll 을 안 따라감
+        # (pitch 는 따라감). 검증툴이 roll 적용여부 결정에 씀.
+        if co.has_option("MODE", "IS_WORLD_ALIGNED"):
+            out["camera_world_aligned"] = int(co["MODE"]["IS_WORLD_ALIGNED"])
+        if co.has_section("GFORCES"):
+            out["camera_gforce_mix"] = co["GFORCES"].get("MIX", "")
+        if co.has_section("SHAKE"):
+            out["camera_shake_scale"] = co["SHAKE"].get("SCALE", "")
+    except Exception:
+        pass
+    return out
+
+
 class Clock:
     """수집 시작(perf_counter) 기준 상대 시간을 주는 단일 시계.
     두 로거가 반드시 이 시계를 공유해야 timestamp가 같은 축 위에 놓인다."""
@@ -106,7 +141,8 @@ def collect(out_dir: str, run_id: str | None = None,
             host: str = "127.0.0.1", port: int = 2345, opp_port: int = 2346,
             capture_region: tuple[int, int, int, int] | None = None,
             capture_backend: str = "auto",
-            image_format: str = "jpg") -> Path:
+            image_format: str = "jpg",
+            onboard_camera: int = 0) -> Path:
     """사람 주행 데이터 수집 메인 루프.
 
     telemetry_hz / image_hz : 각 스트림의 목표 기록 주파수(서로 달라도 됨).
@@ -115,6 +151,10 @@ def collect(out_dir: str, run_id: str | None = None,
     capture_region          : (left, top, width, height). None이면 주 모니터 전체.
     capture_backend         : "auto"(dxcam→mss) | "dxcam" | "mss".
     image_format            : "jpg"(빠름/작음) | "png"(무손실/느림).
+    onboard_camera          : 이 수집에 쓴 F6 온보드캠 인덱스(cameras.ini CAMERA_N). 기본 0.
+        게임은 활성 온보드캠 번호를 어디에도 노출하지 않으므로(camera_manager 의 DRIVABLE_MODE
+        는 F1 뷰만 추적, telemetry 에도 없음), **사용자가 선언한 값을 meta 에 박아** 뷰어/검증이
+        정확한 카메라로 투영하게 한다. 실제 F6 뷰와 이 값이 어긋나면 박스가 안 맞으니 주의.
     """
     run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(out_dir) / run_id
@@ -152,6 +192,8 @@ def collect(out_dir: str, run_id: str | None = None,
     img_recorder = ThreadedImageRecorder(
         run_dir, clock, screen, image_hz=image_hz, image_ext=image_format).start()
     print(f"[capture] image_format={img_recorder.image_ext} (스레드 분리 캡처)")
+    print(f"[camera] 온보드캠 = CAMERA_{onboard_camera} (cameras.ini)  "
+          f"→ 게임 F6 뷰가 이 카메라인지 확인! (다르면 --onboard-camera 로 지정)")
 
     print(f"[collect] telemetry {telemetry_hz}Hz / image {image_hz}Hz. Ctrl+C 로 종료.")
     try:
@@ -190,6 +232,10 @@ def collect(out_dir: str, run_id: str | None = None,
         meta = {
             "run_dir": str(run_dir),
             "source": "human_driving",
+            "onboard_camera_index": onboard_camera,
+            "onboard_camera_name": (f"CAMERA_{onboard_camera}"
+                                    if onboard_camera >= 0 else "DASH"),
+            **_camera_cfg_snapshot(),
             "telemetry_hz": telemetry_hz,
             "image_hz": image_hz,
             "telemetry_hz_actual": round(tel_hz_actual, 2),
@@ -256,6 +302,9 @@ def main():
                     help="left,top,width,height (예: 0,0,640,480). 생략 시 주 모니터 전체")
     ap.add_argument("--image-format", default="jpg", choices=["jpg", "png"],
                     help="이미지 저장 포맷: jpg(빠름/작음, 기본) | png(무손실/느림)")
+    ap.add_argument("--onboard-camera", type=int, default=0,
+                    help="이 수집에 쓴 F6 온보드캠 인덱스(cameras.ini CAMERA_N, 기본 0). "
+                         "게임이 활성 온보드캠을 노출 안 하므로 사용자가 지정해 meta 에 기록한다.")
     args = ap.parse_args()
 
     region = (tuple(int(x) for x in args.capture_region.split(","))
@@ -266,7 +315,7 @@ def main():
             max_seconds=args.max_seconds, host=args.host, port=args.port,
             opp_port=args.opp_port,
             capture_region=region, capture_backend=args.capture_backend,
-            image_format=args.image_format)
+            image_format=args.image_format, onboard_camera=args.onboard_camera)
 
 
 if __name__ == "__main__":
