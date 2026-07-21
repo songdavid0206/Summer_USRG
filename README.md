@@ -1,13 +1,55 @@
-# Assetto Corsa 데이터셋 취득 파이프라인
+# Summer_USRG — Assetto Corsa E2E 데이터셋 파이프라인
 
-`dasGringuen/assetto_corsa_gym` 을 **참조**해, 사람이 직접 주행하는 동안
-**이미지 + ego 차량정보 + 상대차 + 사람 조작값**을 timestamp로 동기화해
-학습 가능한 dataset으로 저장하는 **취득 파이프라인**.
+Assetto Corsa 주행에서 **카메라 이미지, ego telemetry, 조작 라벨, 상대차 3D 상태와 트랙 정보**를
+동기화해 E2E imitation learning 및 autonomous racing 연구용 데이터셋으로 만드는 파이프라인이다.
 
-> 참조 레포는 게임 데이터를 받아 RL을 하는 코드다. 우리가 만드는 건 그 학습 코드가
-> 아니라, 그 앞 단계인 **데이터셋 수집 시스템**이다. 모은 데이터는 이후 IL/RL에 쓴다.
+> [`dasGringuen/assetto_corsa_gym`](https://github.com/dasGringuen/assetto_corsa_gym)을 기반으로
+> telemetry 인터페이스를 구성했으며, 이 저장소는 학습 알고리즘보다 앞 단계인 **데이터 취득·동기화·
+> 후처리·품질검증**에 집중한다.
 
-## 현재 상태 (2026-07-20)
+## 문서 안내
+
+| 문서 | 먼저 읽을 때 |
+|---|---|
+| **이 README** | 프로젝트 목적, 빠른 실행, 데이터 구조와 설계 이해 |
+| **[SETUP.md](SETUP.md)** | 새 PC 설치, Content Manager 화면, 카메라·CSP·플러그인 설정 |
+| [Summer_USRG_Validation](https://github.com/songdavid0206/Summer_USRG_Validation) | 3D bbox·BEV·물리 일관성 검증 도구 사용 |
+
+## 목차
+
+- [빠른 시작](#빠른-시작)
+- [현재 상태](#현재-상태-2026-07-21)
+- [파이프라인 구조](#파이프라인-구조)
+- [출력 구조](#출력-구조)
+- [데이터 필드 사전](#데이터-필드-사전)
+- [프레임별 txt export](#프레임별-txt-export)
+- [설치와 CSP 브리지](#설치)
+- [명령어](#사용법)
+- [성능과 수집 주파수](#성능과-수집-주파수)
+
+## 빠른 시작
+
+전체 설치와 Content Manager 클릭 순서는 [SETUP.md](SETUP.md)에 있다. 이미 환경이 설치된 PC에서는
+다음 순서만 따르면 된다.
+
+```powershell
+# 1) Assetto Corsa에서 RACE 세션 진입
+# 2) sensors_par와 AC Dataset Camera Pose 앱 활성화
+# 3) Summer_USRG 저장소 루트에서 수집
+collect --capture-region 0,80,1920,945 --telemetry-hz 100 --image-hz 40 --onboard-camera 0
+
+# 4) 종료 후 기본 무결성 검사
+ac-validate dataset/<run_id>
+
+# 5) 3D bbox와 물리 일관성 확인
+av-check dataset/<run_id>
+av-view dataset/<run_id> --frame 0
+```
+
+정상 시작 로그에는 `telemetry 연결 OK`, `opponents 연결 OK`, `AC Graphics 공유메모리 = 연결`,
+`CSP 실제 카메라 pose = 연결`이 모두 보여야 한다.
+
+## 현재 상태 (2026-07-21)
 
 **게임 실주행·AI 자동주행에서 수집부터 검증용 export까지 전 구간이 동작한다.** 한 번의
 `collect`로 다음을 함께 취득한다.
@@ -40,7 +82,9 @@
 | build 유효 프레임 | 3,200 |
 | 40 Hz export | 3,197프레임, 중복 0 / 빈 격자 3 |
 
-## 설계 핵심 — 독립 raw 기록 → AC 게임시간/렌더 기준 오프라인 정렬
+## 파이프라인 구조
+
+### 설계 핵심 — 독립 raw 기록 → AC 게임시간/렌더 기준 오프라인 정렬
 
 telemetry와 image는 서로 다른 주기로 들어오므로 먼저 각각 원본을 보존하고, 수집 종료 후
 **카메라 프레임을 기준으로** 정렬한다. 새 run은 PC wall-clock의 가장 가까운 샘플을 단순히 고르는
@@ -109,6 +153,13 @@ dataset/<run_id>/                     # run_id = 수집 시각 (YYYYMMDD_HHMMSS)
   ego_state는 이미지에 맞춰진 rate이며, **고주파 원본은 `telemetry_raw.parquet`에 그대로 보존**된다.
 
 ---
+
+## 데이터 필드 사전
+
+GitHub에서는 아래 영역을 접어 두었다. 필요한 데이터 종류를 확인할 때 펼치면 된다.
+
+<details>
+<summary><strong>카메라, ego, opponent, processed 필드 전체 보기</strong></summary>
 
 ## 카메라·same-render 차량 필드
 
@@ -338,9 +389,11 @@ frames = ego.loc[ego.valid, "frame"].to_numpy()   # 자차가 주행 중인 프�
 opp_now = opp[opp.frame.isin(frames) & opp.valid]
 ```
 
+</details>
+
 ---
 
-## 프레임별 txt 데이터셋 (`ac-export`)
+## 프레임별 txt export
 
 parquet 대신 **프레임 하나당 파일 하나**로 푼 포맷. `collect` 종료 시 자동 생성되고
 `ac-export dataset/<run_id>` 로 수동 생성도 된다. 파일명은 **균일 격자 위의 시각(ms)** 이다.
@@ -588,7 +641,7 @@ ms 중복 없음 / **리타이어 상대차가 OBJECT_INFO 에서 빠졌는지**
 python tests/test_offline.py
 ```
 
-## 수집 주파수(Hz) — 실측 결과와 한계
+## 성능과 수집 주파수
 
 목표 Hz는 `--telemetry-hz`, `--image-hz`로 준다(기본 둘 다 50, 서로 달라도 됨).
 **수집 종료 시 `[rate]`로 실측 Hz가 출력**되고 `meta.json` 의 `telemetry_hz_actual` /
