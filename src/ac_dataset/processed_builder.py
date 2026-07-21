@@ -71,6 +71,7 @@ def _wrap(a):
 TELEPORT_M = 10.0
 STATIC_M = 1.0      # 순간이동 뒤 이 반경 안에 머물면 '고정됨'
 STATIC_KMH = 1.0    # 그리고 사실상 정지
+STATIC_CONFIRM_FRAMES = 20  # 40Hz 기준 0.5초. 이후 재이동/다단계 피트 이동 허용
 
 
 def _detect_retirement(x: np.ndarray, y: np.ndarray, speed_kmh: np.ndarray) -> int | None:
@@ -83,9 +84,14 @@ def _detect_retirement(x: np.ndarray, y: np.ndarray, speed_kmh: np.ndarray) -> i
         return None
     step = np.hypot(np.diff(x), np.diff(y))
     for k in np.where(step > TELEPORT_M)[0] + 1:   # k = 점프해서 도착한 프레임
-        # 도착 후 끝까지 그 자리에 머물러야 리타이어. (한 번 튀고 다시 달리면 글리치)
-        if (np.hypot(x[k:] - x[-1], y[k:] - y[-1]).max() < STATIC_M
-                and np.nanmedian(speed_kmh[k:]) < STATIC_KMH):
+        # CSP는 리타이어 차량을 한 번 피트로 보낸 뒤 세션 종료 때 다른 슬롯으로
+        # 다시 옮길 수 있다. 따라서 "run 끝까지 같은 좌표" 대신, 도착 직후 충분한
+        # 정지 구간을 확인한다. 짧은 좌표 글리치는 곧 재이동하므로 통과하지 못한다.
+        end = min(len(x), k + STATIC_CONFIRM_FRAMES)
+        if end - k < STATIC_CONFIRM_FRAMES:
+            continue
+        if (np.hypot(x[k:end] - x[k], y[k:end] - y[k]).max() < STATIC_M
+                and np.nanmedian(speed_kmh[k:end]) < STATIC_KMH):
             return int(k)
     return None
 
