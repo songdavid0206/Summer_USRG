@@ -1,0 +1,32 @@
+{
+  "selected_solo_sessions": 11,
+  "selected_multi_sessions": 12,
+  "frames": 440344,
+  "minutes": 183.47666666666666,
+  "solo_frames": 195147,
+  "multi_frames": 245197,
+  "weather_minutes": {
+    "multi": {
+      "clear": 42.90125,
+      "mist": 33.46625,
+      "scatteredclouds": 25.797916666666666
+    },
+    "solo": {
+      "clear": 65.15583333333333,
+      "mist": 8.072916666666666,
+      "scatteredclouds": 8.0825
+    }
+  },
+  "interaction_instances": {
+    "barrier_contact": 1,
+    "car_contact": 38,
+    "close_follow": 178,
+    "overtake": 42,
+    "overtake_attempt": 3,
+    "overtaken_by": 6,
+    "overtaken_by_attempt": 1,
+    "side_by_side": 66
+  },
+  "median_solo_run_correlation": 0.9912326544650789,
+  "median_multi_run_correlation": 0.9869704885392385
+}
