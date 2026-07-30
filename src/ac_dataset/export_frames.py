@@ -108,7 +108,6 @@ def read_camera_hfov(model: str | None = None, camera_index: int | None = None) 
     """
     cfg = _ac_cfg_dir()
     vfov_deg = None
-    w, h = 1920.0, 1080.0
     if model is not None and camera_index is not None:
         try:
             from .acd import read_onboard_cameras_by_model
@@ -126,13 +125,18 @@ def read_camera_hfov(model: str | None = None, camera_index: int | None = None) 
             vfov_deg = float(co[sec]["FOV"])
         except Exception:
             pass
+    return camera_vfov_to_hfov(vfov_deg)
+
+
+def camera_vfov_to_hfov(vfov_deg: float) -> float:
+    """Convert CSP/AC vertical FOV degrees to horizontal radians."""
+    w, h = 1920.0, 1080.0
     try:
-        vid = _read_ini(cfg / "video.ini")["VIDEO"]
+        vid = _read_ini(_ac_cfg_dir() / "video.ini")["VIDEO"]
         w, h = float(vid["WIDTH"]), float(vid["HEIGHT"])
     except Exception:
         pass
-    vfov = math.radians(vfov_deg)
-    return 2.0 * math.atan(math.tan(vfov / 2.0) * (w / h))
+    return 2.0 * math.atan(math.tan(math.radians(vfov_deg) / 2.0) * (w / h))
 
 
 def read_car_models() -> dict[int, str]:
@@ -214,7 +218,9 @@ def _grid_slots(t_img: np.ndarray, grid_hz: float):
 # --------------------------------------------------------------------------- 본체
 def export_run(run_dir: str | Path, out_root: str | Path | None = None,
                hfov: float | None = None, max_range: float | None = None,
-               only_valid: bool = True, grid_hz: float | None = None) -> Path:
+               only_valid: bool = True, grid_hz: float | None = None,
+               out_dir: str | Path | None = None,
+               include_all_objects: bool = False) -> Path:
     """run 하나를 CAMERA/EGO_INFO/OBJECT_INFO 구조로 내보낸다.
 
     hfov      : 수평 화각(도). None 이면 게임 설정에서 읽는다.
@@ -240,8 +246,16 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
         _cam_idx = _meta.get("onboard_camera_index")
     except Exception:
         pass
-    hfov_rad = (math.radians(hfov) if hfov is not None
-                else read_camera_hfov(models.get(0), _cam_idx))
+    fov_source = "--hfov"
+    if hfov is not None:
+        hfov_rad = math.radians(hfov)
+    elif "cam_fov_deg" in cam.columns and cam["cam_fov_deg"].notna().any():
+        render_vfov = float(cam.loc[cam["cam_fov_deg"].notna(), "cam_fov_deg"].median())
+        hfov_rad = camera_vfov_to_hfov(render_vfov)
+        fov_source = f"CSP render camera vfov={render_vfov:.3f}deg"
+    else:
+        hfov_rad = read_camera_hfov(models.get(0), _cam_idx)
+        fov_source = f"cameras.ini CAMERA_{_cam_idx} fallback"
     half_fov = hfov_rad / 2.0
     dims, dim_reliable = _load_dimensions(models)   # car_id -> (L, W, H), data.acd 에서
     steer_lock = _load_steer_lock(models)           # 도. steerNorm*steer_lock = 조향각(도)
@@ -278,7 +292,7 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
     # 기본 출력 위치는 run 폴더와 나란히 (dataset/<run_id>_<track>_<hz>hz).
     # run 폴더(dataset/<run_id>)와 이름이 겹치지 않는다 — 뒤에 트랙/Hz가 붙기 때문.
     out_root = Path(out_root) if out_root else run_dir.parent
-    out = out_root / name
+    out = Path(out_dir) if out_dir is not None else out_root / name
     for sub in ("CAMERA", "EGO_INFO", "OBJECT_INFO"):
         d = out / sub
         if d.exists():
@@ -289,6 +303,9 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
                   "orientation.x, orientation.y, orientation.z, orientation.w, "
                   "dimension.length, dimension.width, dimension.height, "
                   "velocity.x, velocity.y, velocity.z, track_id")
+    if include_all_objects:
+        obj_header += (", visible, relative.forward, relative.lateral, distance, "
+                       "closing_speed")
 
     # 실측 시각을 균일 격자에 리샘플 → 파일명이 정확한 ms 배수(간격 균일).
     t_img = cam["t_img"].to_numpy()
@@ -337,11 +354,11 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
             if bool(r.get("retired", False)) or not bool(r.get("present", True)):
                 continue
             fwd, lat = float(r["opp_forward"]), float(r["opp_lateral"])
-            if fwd <= 0:
-                continue
-            if abs(math.atan2(lat, fwd)) > half_fov:
-                continue
-            if max_range is not None and float(r["distance"]) > max_range:
+            distance = float(r["distance"])
+            visible = (fwd > 0
+                       and abs(math.atan2(lat, fwd)) <= half_fov
+                       and (max_range is None or distance <= max_range))
+            if not include_all_objects and not visible:
                 continue
 
             # 차체 방향: yaw_body(접지점 기반) 우선, 없으면 속도벡터 방향(정지 시 부정확)
@@ -357,10 +374,15 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
             v_fwd, v_lat = vx * c + vy * s, -vx * s + vy * c
 
             opp_z = float(r["opp_z"]) if "opp_z" in o.columns and pd.notna(r["opp_z"]) else 0.0
-            rows.append("%.10f, %.10f, %.10f, %.12f, %.12f, %.12f, %.12f, "
-                        "%.10f, %.10f, %.10f, %.10f, %.10f, %.10f, %d"
-                        % (float(r["opp_x"]), float(r["opp_y"]), opp_z,
-                           ox, oy, oz, ow, L, W, H, v_fwd, v_lat, vz, oid))
+            base = ("%.10f, %.10f, %.10f, %.12f, %.12f, %.12f, %.12f, "
+                    "%.10f, %.10f, %.10f, %.10f, %.10f, %.10f, %d"
+                    % (float(r["opp_x"]), float(r["opp_y"]), opp_z,
+                       ox, oy, oz, ow, L, W, H, v_fwd, v_lat, vz, oid))
+            if include_all_objects:
+                closing = float(r["closing_speed"]) if pd.notna(r.get("closing_speed")) else float("nan")
+                base += ", %d, %.10f, %.10f, %.10f, %.10f" % (
+                    int(visible), fwd, lat, distance, closing)
+            rows.append(base)
         n_objects += len(rows)
         (out / "OBJECT_INFO" / ("%d.txt" % ms)).write_text(
             obj_header + "\n" + "\n".join(rows) + ("\n" if rows else ""), encoding="utf-8")
@@ -377,8 +399,10 @@ def export_run(run_dir: str | Path, out_root: str | Path | None = None,
         "frames_skipped_ego_invalid": int(len(slots) - n_written) if only_valid else 0,
         "objects_total": n_objects,
         "objects_per_frame": round(n_objects / n_written, 3) if n_written else 0,
+        "object_scope": "all_valid_with_visibility" if include_all_objects else "visible_only",
         "image_hz_actual": meta.get("image_hz_actual"),
         "hfov_deg": round(math.degrees(hfov_rad), 3),
+        "fov_source": fov_source,
         "max_range_m": max_range,
         "steer_angle_source": steer_note,
         "steer_lock_deg": steer_lock,

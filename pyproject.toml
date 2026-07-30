@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ac_dataset"
-version = "0.1.0"
+version = "0.2.0"
 description = "Assetto Corsa 사람 주행 데이터셋 취득 파이프라인 (이미지 + ego + 상대차 + 조작값)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,7 +18,10 @@ dependencies = [
 
 [project.optional-dependencies]
 # Windows에서 더 빠른 화면 캡처 백엔드 (없으면 mss로 자동 폴백)
-capture = ["dxcam; platform_system == 'Windows'"]
+capture = [
+    "dxcam; platform_system == 'Windows'",
+    "windows-cap; platform_system == 'Windows'",
+]
 
 [project.scripts]
 # 설치 후 아래 명령들을 어느 폴더에서든 실행 가능
@@ -28,6 +31,7 @@ ac-view = "ac_dataset.view:main"
 ac-track = "ac_dataset.track:main"
 ac-process = "ac_dataset.processed_builder:main"
 ac-export = "ac_dataset.export_frames:main"
+ac-export-v2 = "ac_dataset.structured_export:main"
 ac-validate = "ac_dataset.validate:main"
 
 [tool.setuptools.packages.find]

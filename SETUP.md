@@ -24,7 +24,7 @@
 | Content Manager | 세션·차량·트랙·CSP 설정 | 권장 |
 | Custom Shaders Patch (CSP) | Lua 앱과 실제 렌더 pose 제공 | 필수 |
 | `sensors_par` | ego/opponent telemetry 서버 | 필수 |
-| AC Dataset Camera Pose Bridge v2 | 실제 카메라와 same-render 차량 상태 기록 | 3D bbox 수집 시 필수 |
+| AC Dataset Camera Pose Bridge v3 | 실제 카메라·same-render 차량 상태·충돌 GT 기록 | 필수 |
 | Python 3.9 이상 | 수집·정렬·검증 CLI | 필수 |
 | `dxcam` | Windows 고속 화면 캡처 | 권장, 없으면 mss fallback |
 
@@ -98,12 +98,13 @@ Summer_USRG\csp_apps\ac_camera_pose_bridge
 
 복사 후 트랙에 진입하고 오른쪽 앱 사이드바에서 **AC Dataset Camera Pose**를 실행한다.
 
-브리지 v2가 매 CSP `script.update`에서 기록하는 값:
+브리지 v3가 매 CSP `script.update` 및 물리 충돌 callback에서 기록하는 값:
 
 - 실제 렌더 카메라 `position / forward / up / FOV`
 - 전체 차량 `position / look / up`
 - 차량 visual AABB
 - render frame, game/lap time, 차량 state timestamp
+- 자차 충돌 시작, 충돌 상대(차량/벽), 차체 기준 접촉 위치, 상대속도, 손상 구역
 
 이미지 픽셀이나 이미지 검출 결과는 브리지 입력으로 사용하지 않는다.
 

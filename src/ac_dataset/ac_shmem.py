@@ -119,8 +119,11 @@ class ACGraphicsShm:
 CAMERA_POSE_CAPACITY = 128
 RENDER_CAR_MAX = 32
 RENDER_CAR_SLOTS = CAMERA_POSE_CAPACITY * RENDER_CAR_MAX
+COLLISION_EVENT_CAPACITY = 256
+COLLISION_DAMAGE_ZONES = 5
+COLLISION_DAMAGE_SLOTS = COLLISION_EVENT_CAPACITY * COLLISION_DAMAGE_ZONES
 CAMERA_POSE_MAGIC = 0x41434350  # ASCII "ACCP"
-CAMERA_POSE_VERSION = 2
+CAMERA_POSE_VERSION = 3
 
 
 class CameraPoseRing(ctypes.Structure):
@@ -168,6 +171,20 @@ class CameraPoseRing(ctypes.Structure):
         ("car_aabb_length", c_float * RENDER_CAR_SLOTS),
         ("car_aabb_width", c_float * RENDER_CAR_SLOTS),
         ("car_aabb_height", c_float * RENDER_CAR_SLOTS),
+        ("collision_write_index", c_uint32),
+        ("collision_slot_seq", c_uint32 * COLLISION_EVENT_CAPACITY),
+        ("collision_render_frame", c_int32 * COLLISION_EVENT_CAPACITY),
+        ("collision_sim_time_ms", c_float * COLLISION_EVENT_CAPACITY),
+        ("collision_lap_time_ms", c_int32 * COLLISION_EVENT_CAPACITY),
+        ("collision_lap_count", c_int32 * COLLISION_EVENT_CAPACITY),
+        ("collision_car_id", c_int32 * COLLISION_EVENT_CAPACITY),
+        ("collision_with", c_int32 * COLLISION_EVENT_CAPACITY),
+        ("collision_depth", c_float * COLLISION_EVENT_CAPACITY),
+        ("collision_pos_forward", c_float * COLLISION_EVENT_CAPACITY),
+        ("collision_pos_right", c_float * COLLISION_EVENT_CAPACITY),
+        ("collision_pos_up", c_float * COLLISION_EVENT_CAPACITY),
+        ("collision_relative_speed_mps", c_float * COLLISION_EVENT_CAPACITY),
+        ("collision_damage", c_float * COLLISION_DAMAGE_SLOTS),
     ]
 
 
@@ -178,8 +195,8 @@ class ACCameraPoseShm:
     게임시간만으로 캡처 프레임에 가장 가까운 pose를 선택한다.
     """
 
-    _NAMES = ("AcTools.ACDataset.RenderState.v2",
-              "Local\\AcTools.ACDataset.RenderState.v2")
+    _NAMES = ("AcTools.ACDataset.RenderState.v3",
+              "Local\\AcTools.ACDataset.RenderState.v3")
 
     def __init__(self):
         self._mm = None
@@ -188,6 +205,7 @@ class ACCameraPoseShm:
         # locking the whole capture to the wrong render tick.
         self._packet_offset_votes: Counter[int] = Counter()
         self._packet_render_offset: int | None = None
+        self._last_collision_seq = 0
         size = ctypes.sizeof(CameraPoseRing)
         for name in self._NAMES:
             try:
@@ -195,6 +213,15 @@ class ACCameraPoseShm:
                 break
             except Exception:
                 self._mm = None
+        # Ignore collision events that occurred before this collection started.
+        if self._mm is not None:
+            try:
+                initial = CameraPoseRing.from_buffer_copy(self._mm[:size])
+                complete = [int(seq) for seq in initial.collision_slot_seq
+                            if seq and not (int(seq) & 1)]
+                self._last_collision_seq = max(complete, default=0)
+            except Exception:
+                pass
 
     @property
     def available(self) -> bool:
@@ -265,6 +292,7 @@ class ACCameraPoseShm:
         if not all(math.isfinite(float(v)) for v in vals):
             return None
         result = {
+            "csp_bridge_version": int(b.version),
             "cam_pose_seq": int(b.slot_seq[i]),
             "cam_render_frame": int(b.render_frame[i]),
             "cam_sim_time_ms": float(b.sim_time_ms[i]),
@@ -324,6 +352,47 @@ class ACCameraPoseShm:
                 "aabb_height": float(b.car_aabb_height[k]),
             })
         result["_render_cars"] = cars
+        collision_events = []
+        last_collision_seq = getattr(self, "_last_collision_seq", 0)
+        newest_collision_seq = last_collision_seq
+        for j in range(COLLISION_EVENT_CAPACITY):
+            seq = int(b.collision_slot_seq[j])
+            if (seq == 0 or seq & 1 or seq != int(a.collision_slot_seq[j])
+                    or seq <= last_collision_seq):
+                continue
+            values = [
+                b.collision_sim_time_ms[j], b.collision_depth[j],
+                b.collision_pos_forward[j], b.collision_pos_right[j],
+                b.collision_pos_up[j], b.collision_relative_speed_mps[j],
+            ]
+            damage = [
+                float(b.collision_damage[j * COLLISION_DAMAGE_ZONES + zone])
+                for zone in range(COLLISION_DAMAGE_ZONES)
+            ]
+            if not all(math.isfinite(float(value)) for value in values + damage):
+                continue
+            collision_events.append({
+                "collision_event_seq": seq,
+                "collision_render_frame": int(b.collision_render_frame[j]),
+                "collision_sim_time_ms": float(b.collision_sim_time_ms[j]),
+                "collision_lap_time_ms": int(b.collision_lap_time_ms[j]),
+                "collision_lap_count": int(b.collision_lap_count[j]),
+                "collision_car_id": int(b.collision_car_id[j]),
+                "collision_with": int(b.collision_with[j]),
+                "collision_depth_m": float(b.collision_depth[j]),
+                "collision_position_forward": float(b.collision_pos_forward[j]),
+                "collision_position_right": float(b.collision_pos_right[j]),
+                "collision_position_up": float(b.collision_pos_up[j]),
+                "collision_relative_speed_mps": float(
+                    b.collision_relative_speed_mps[j]),
+                **{f"collision_damage_{zone}": damage[zone]
+                   for zone in range(COLLISION_DAMAGE_ZONES)},
+            })
+            newest_collision_seq = max(newest_collision_seq, seq)
+        if collision_events:
+            collision_events.sort(key=lambda event: event["collision_event_seq"])
+            self._last_collision_seq = newest_collision_seq
+        result["_collision_events"] = collision_events
         return result
 
     def close(self):

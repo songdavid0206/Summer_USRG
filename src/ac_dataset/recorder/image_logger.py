@@ -23,7 +23,7 @@ from PIL import Image
 
 class ImageLogger:
     def __init__(self, run_dir: str | Path, image_ext: str = "jpg",
-                 jpg_quality: int = 95):
+                 jpg_quality: int = 85):
         self.run_dir = Path(run_dir)
         self.img_dir = self.run_dir / "camera"
         self.img_dir.mkdir(parents=True, exist_ok=True)
@@ -32,6 +32,7 @@ class ImageLogger:
         self.jpg_quality = jpg_quality
         self._rows: list[dict] = []
         self._render_car_rows: list[dict] = []
+        self._collision_rows: list[dict] = []
         self.frame_idx = 0
 
     @staticmethod
@@ -64,7 +65,7 @@ class ImageLogger:
         rel_path = f"camera/{self.frame_idx:06d}.{self.image_ext}"
         img = Image.fromarray(arr)
         if self.image_ext == "jpg":
-            # JPG: PNG보다 인코딩 훨씬 빠르고 용량 작음(무손실은 아님). 품질 95로 손실 최소화.
+            # 학습 시 축소되는 영상이라 품질 85로 저장 부하와 용량을 줄인다.
             img.save(self.run_dir / rel_path, quality=self.jpg_quality)
         else:
             img.save(self.run_dir / rel_path)
@@ -83,6 +84,12 @@ class ImageLogger:
             row.update({k: v for k, v in camera_pose.items() if not k.startswith("_")})
             for car in camera_pose.get("_render_cars", []):
                 self._render_car_rows.append({"image_frame": self.frame_idx, "t": t, **car})
+            for event in camera_pose.get("_collision_events", []):
+                self._collision_rows.append({
+                    "image_frame": self.frame_idx,
+                    "capture_t": t,
+                    **event,
+                })
         self._rows.append(row)
         self.frame_idx += 1
         return rel_path
@@ -113,9 +120,20 @@ class ImageLogger:
             cars.to_parquet(self.run_dir / "render_car_state.parquet", index=False)
             print(f"[image] render car states: {len(cars)} rows / "
                   f"{cars['image_frame'].nunique()} frames")
+        collisions = pd.DataFrame(self._collision_rows)
+        if len(collisions):
+            collisions.to_parquet(self.run_dir / "collision_events.parquet", index=False)
+            car_contacts = int((collisions["collision_with"] > 0).sum())
+            print(f"[image] collision GT: {len(collisions)} events "
+                  f"(car {car_contacts} / barrier {len(collisions) - car_contacts})")
         render_car_frames = int(cars["image_frame"].nunique()) if len(cars) else 0
+        bridge_version = (int(df["csp_bridge_version"].dropna().max())
+                          if "csp_bridge_version" in df.columns
+                          and df["csp_bridge_version"].notna().any() else None)
         return {"image_frames": len(df), "camera_pose_frames": pose_frames,
                 "camera_pose_coverage": pose_frames / len(df) if len(df) else 0.0,
+                "csp_bridge_version": bridge_version,
                 "render_car_frames": render_car_frames,
                 "render_car_rows": len(cars),
-                "render_car_coverage": render_car_frames / len(df) if len(df) else 0.0}
+                "render_car_coverage": render_car_frames / len(df) if len(df) else 0.0,
+                "collision_events": len(collisions)}

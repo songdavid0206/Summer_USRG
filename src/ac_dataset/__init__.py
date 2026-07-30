@@ -1,22 +1,34 @@
-"""AC 데이터셋 취득 파이프라인 (ac_dataset).
+"""Assetto Corsa dataset collection and export package."""
 
-사람이 Assetto Corsa를 직접 주행하는 동안 이미지 + 자차(ego) 상태 + 상대차 + 조작값을
-수집해, 카메라 프레임 기준으로 정렬된 dataset(camera/ ego_state/ opponent/)으로 저장한다.
+from __future__ import annotations
 
-공개 API
---------
-- collect        : 주행 중 수집 메인 루프 (게임 필요)
-- build_dataset  : raw 스트림 -> camera/ego_state/opponent 폴더로 정렬 (오프라인)
-"""
+from importlib import import_module
 
-from .collect import collect
-from .recorder.dataset_builder import build_dataset
-from .track import parse_fast_lane, extract_track_for_run, identify_track
-from .processed_builder import build_processed
-from .export_frames import export_run
-from .validate import validate_run
+__all__ = [
+    "collect", "build_dataset", "parse_fast_lane", "extract_track_for_run",
+    "identify_track", "build_processed", "export_run", "export_structured",
+    "validate_run",
+]
+__version__ = "0.2.0"
 
-__all__ = ["collect", "build_dataset",
-           "parse_fast_lane", "extract_track_for_run", "identify_track",
-           "build_processed", "export_run", "validate_run"]
-__version__ = "0.1.0"
+_LAZY_EXPORTS = {
+    "collect": (".collect", "collect"),
+    "build_dataset": (".recorder.dataset_builder", "build_dataset"),
+    "parse_fast_lane": (".track", "parse_fast_lane"),
+    "extract_track_for_run": (".track", "extract_track_for_run"),
+    "identify_track": (".track", "identify_track"),
+    "build_processed": (".processed_builder", "build_processed"),
+    "export_run": (".export_frames", "export_run"),
+    "export_structured": (".structured_export", "export_structured"),
+    "validate_run": (".validate", "validate_run"),
+}
+
+
+def __getattr__(name: str):
+    try:
+        module_name, attribute = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(name) from exc
+    value = getattr(import_module(module_name, __name__), attribute)
+    globals()[name] = value
+    return value

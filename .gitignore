@@ -1,5 +1,6 @@
 # 수집된 데이터셋(대용량 이미지/parquet) — 코드 백업 대상 아님
 dataset/
+dataset_v2/
 
 # 파이썬 캐시
 __pycache__/
@@ -14,6 +15,7 @@ dist/
 # 테스트 캡처 이미지 / 백업본
 shot*.png
 *.bak
+reexport_*.log*
 
 # 테스트가 생성하는 출력물
 tests/_out/

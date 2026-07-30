@@ -9,6 +9,7 @@ ScreenCapture - 게임 화면을 직접 캡처
 
 백엔드
 -----
+- wgc   : Windows Graphics Capture로 특정 창만 캡처. 다른 창이 앞에 와도 대상 창을 유지.
 - dxcam : Windows Desktop Duplication 기반. mss보다 훨씬 빠름(게임 FPS 덜 깎임). 우선 사용.
 - mss   : dxcam 미설치/실패 시 폴백. 느릴 수 있음(레포도 640x480/25Hz로 제한).
 
@@ -31,24 +32,37 @@ import numpy as np
 
 class ScreenCapture:
     def __init__(self, region: tuple[int, int, int, int] | None = None,
-                 backend: str = "auto", monitor_idx: int = 0):
+                 backend: str = "auto", monitor_idx: int = 0,
+                 window_title: str | None = None):
         """
-        region      : (left, top, width, height). None이면 주 모니터 전체.
-                      게임 창만 잡고 싶으면 창의 화면 좌표를 넣는다.
-        backend     : "dxcam" | "mss" | "auto"(dxcam 시도 후 실패 시 mss).
+        region      : (left, top, width, height). wgc에서는 창 client 기준 crop,
+                      나머지는 모니터 기준 좌표.
+        backend     : "wgc" | "dxcam" | "mss" | "auto".
         monitor_idx : 다중 모니터에서 캡처할 모니터 인덱스(0 = 주 모니터).
+        window_title: wgc로 캡처할 창 제목. 일부 문자열도 허용한다.
         """
         self.region = region
         self.monitor_idx = monitor_idx
+        self.window_title = window_title
+        self.resolved_window_title: str | None = None
         self._last_frame: np.ndarray | None = None
         self.backend = None
         self._impl = None
 
-        order = ["dxcam", "mss"] if backend == "auto" else [backend]
+        if window_title:
+            if backend not in {"auto", "wgc"}:
+                raise ValueError("window_title은 wgc/auto backend에서만 사용할 수 있습니다")
+            # 창 캡처 요청을 모니터 캡처로 조용히 폴백하면 다른 앱 화면이
+            # 데이터에 들어가므로 실패를 명시적으로 알린다.
+            order = ["wgc"]
+        else:
+            order = ["dxcam", "mss"] if backend == "auto" else [backend]
         errors = []
         for name in order:
             try:
-                if name == "dxcam":
+                if name == "wgc":
+                    self._init_wgc()
+                elif name == "dxcam":
                     self._init_dxcam()
                 elif name == "mss":
                     self._init_mss()
@@ -58,10 +72,56 @@ class ScreenCapture:
                 errors.append(f"{name}: {e}")
         if self.backend is None:
             raise RuntimeError(
-                "화면 캡처 백엔드 초기화 실패. `pip install dxcam` 또는 `pip install mss` 필요.\n"
+                "화면 캡처 백엔드 초기화 실패. wgc는 `pip install windows-cap`, "
+                "모니터 캡처는 `pip install dxcam` 또는 `pip install mss` 필요.\n"
                 + "\n".join(errors))
 
     # ---- 백엔드별 초기화 -----------------------------------------------------
+    @staticmethod
+    def _window_titles() -> list[str]:
+        """현재 보이는 최상위 Windows 창 제목을 열거한다."""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        titles: list[str] = []
+        callback_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def callback(hwnd, _lparam):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0 and user32.IsWindowVisible(hwnd):
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if buf.value:
+                    titles.append(buf.value)
+            return True
+
+        user32.EnumWindows(callback, 0)
+        return titles
+
+    def _init_wgc(self):
+        if not self.window_title:
+            raise ValueError("wgc backend에는 window_title이 필요합니다")
+        from windows_cap import WindowCapture
+
+        query = self.window_title.casefold()
+        titles = self._window_titles()
+        exact = [title for title in titles if title.casefold() == query]
+        partial = [title for title in titles if query in title.casefold()]
+        matches = exact or partial
+        if not matches:
+            raise RuntimeError(
+                f"창 제목에 {self.window_title!r}을 포함한 창을 찾지 못했습니다. "
+                f"현재 창: {titles}")
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"창 제목이 여러 개와 일치합니다: {matches}. 더 정확히 지정하세요")
+        self.resolved_window_title = matches[0]
+        self._impl = WindowCapture(self.resolved_window_title)
+        self._impl.start_capture()
+
     def _init_dxcam(self):
         import dxcam
         # RGB로 바로 받기. output_idx = 모니터.
@@ -89,6 +149,21 @@ class ScreenCapture:
     # ---- 캡처 ----------------------------------------------------------------
     def grab(self) -> np.ndarray | None:
         """한 프레임 캡처해 (H,W,3) uint8 RGB 반환. 실패 시 마지막 프레임."""
+        if self.backend == "wgc":
+            raw = self._impl.next()
+            width, height = self._impl.client_size
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 4)
+            arr = arr[:, :, :3][:, :, ::-1]  # BGRA -> RGB
+            if self.region is not None:
+                left, top, crop_width, crop_height = self.region
+                right, bottom = left + crop_width, top + crop_height
+                if (left < 0 or top < 0 or right > width or bottom > height):
+                    raise ValueError(
+                        f"wgc crop {self.region}이 창 client {width}x{height} 밖입니다")
+                arr = arr[top:bottom, left:right]
+            self._last_frame = np.ascontiguousarray(arr)
+            return self._last_frame
+
         if self.backend == "dxcam":
             frame = self._impl.grab(region=self._dxcam_region)  # 변화 없으면 None 가능
             if frame is None:
@@ -107,6 +182,8 @@ class ScreenCapture:
         try:
             if self.backend == "dxcam" and self._impl is not None:
                 self._impl.release()
+            elif self.backend == "wgc":
+                self._impl = None
             elif self.backend == "mss":
                 self._sct.close()
         except Exception:
@@ -120,14 +197,18 @@ if __name__ == "__main__":
     from PIL import Image
 
     ap = argparse.ArgumentParser(description="화면 캡처 스모크 테스트")
-    ap.add_argument("--backend", default="auto", choices=["auto", "dxcam", "mss"])
+    ap.add_argument("--backend", default="auto",
+                    choices=["auto", "wgc", "dxcam", "mss"])
+    ap.add_argument("--window-title", default=None,
+                    help="wgc 대상 창 제목 일부(예: Assetto Corsa)")
     ap.add_argument("--region", default=None,
                     help="left,top,width,height (예: 0,0,640,480). 생략 시 전체 모니터")
     ap.add_argument("--save", default="capture_test.png")
     args = ap.parse_args()
 
     region = tuple(int(x) for x in args.region.split(",")) if args.region else None
-    cap = ScreenCapture(region=region, backend=args.backend)
+    cap = ScreenCapture(region=region, backend=args.backend,
+                        window_title=args.window_title)
     frame = cap.grab()
     cap.close()
 

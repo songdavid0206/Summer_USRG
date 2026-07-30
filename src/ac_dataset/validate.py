@@ -33,6 +33,40 @@ class Check:
         return {"name": self.name, "pass": self.passed, "detail": self.detail}
 
 
+def _game_alignment(cam: pd.DataFrame, ego: pd.DataFrame,
+                    tolerance_ms: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (residual_ms, boundary_ambiguous, bad_regular) masks.
+
+    Image and telemetry wall clocks can diverge when capture/encoding stalls,
+    so alignment is judged with AC's per-lap game clock. At the finish line AC
+    can update the spline clock and lap counters on adjacent ticks; those
+    boundary rows are reported separately and filtered by structured export.
+    """
+    required_cam = {"game_time_ms", "completed_laps"}
+    required_ego = {"currentTime", "NormalizedSplinePosition"}
+    if not required_cam <= set(cam) or not required_ego <= set(ego):
+        empty = np.zeros(min(len(cam), len(ego)), dtype=bool)
+        return np.full(len(empty), np.nan), empty, ~empty
+
+    game_cam = pd.to_numeric(cam["game_time_ms"], errors="coerce").to_numpy(float)
+    game_ego = pd.to_numeric(ego["currentTime"], errors="coerce").to_numpy(float)
+    lap_cam = pd.to_numeric(cam["completed_laps"], errors="coerce").to_numpy(float)
+    lap_col = "completedLaps" if "completedLaps" in ego else "LapCount"
+    lap_ego = pd.to_numeric(ego[lap_col], errors="coerce").to_numpy(float)
+    spline = pd.to_numeric(
+        ego["NormalizedSplinePosition"], errors="coerce").to_numpy(float)
+    residual = np.abs(game_cam - game_ego)
+    finite = (np.isfinite(residual) & np.isfinite(lap_cam)
+              & np.isfinite(lap_ego) & np.isfinite(spline))
+    lap_equal = lap_cam == lap_ego
+    near_line = spline <= 0.02
+    boundary = finite & near_line & (
+        ~lap_equal | (game_cam > 5000.0) | (game_ego > 5000.0))
+    bad_regular = finite & ~boundary & (
+        ~lap_equal | (residual > float(tolerance_ms)))
+    return residual, boundary, bad_regular
+
+
 # --------------------------------------------------------------------------- 1층: 구조
 def _check_structure(run_dir: Path, dt_tol_ms: float = 50.0) -> list[Check]:
     checks: list[Check] = []
@@ -54,11 +88,25 @@ def _check_structure(run_dir: Path, dt_tol_ms: float = 50.0) -> list[Check]:
     checks.append(Check("jpg_count_matches", n_jpg == n,
                         "jpg %d / 행 %d" % (n_jpg, n)))
 
-    # 3) 정렬 오차 dt 가 임계 이내 (카메라 프레임에 가장 가까운 telemetry)
-    if "dt" in ego.columns:
-        dt_max = float(ego["dt"].abs().max()) * 1e3
-        checks.append(Check("alignment_dt_ok", dt_max <= dt_tol_ms,
-                            "dt 최대 %.4f ms (임계 %.1f)" % (dt_max, dt_tol_ms)))
+    # 3) 화면에 기록된 AC game clock과 telemetry lap clock의 정렬 오차.
+    #    wall-clock dt는 캡처 stall/스레드 지연까지 섞이므로 정합 기준으로 사용하지 않는다.
+    residual, boundary, bad = _game_alignment(cam, ego, dt_tol_ms)
+    regular = np.isfinite(residual) & ~boundary
+    if regular.any():
+        p50, p95, max_res = np.percentile(residual[regular], [50, 95, 100])
+        wall_note = ""
+        if "dt" in ego:
+            wall = ego["dt"].abs().to_numpy(float) * 1e3
+            wall_note = ", wall-clock 최대 %.1fms(진단 전용)" % np.nanmax(wall)
+        checks.append(Check(
+            "game_time_alignment_ok", not bool(bad.any()),
+            "게임시간 median %.3f / p95 %.3f / max %.3fms, "
+            "경계 모호 %d프레임 분리%s"
+            % (p50, p95, max_res, int(boundary.sum()), wall_note)))
+    else:
+        checks.append(Check(
+            "game_time_alignment_ok", False,
+            "game_time_ms/currentTime 정렬 채널이 없거나 유효 행이 없음"))
 
     # 4) ego_state / processed 에 NaN 없음 (opp 는 미매칭 프레임에 NaN 가능 → present 로 거름)
     ego_nan = int(ego.isna().sum().sum())
@@ -139,11 +187,73 @@ def _check_export(run_dir: Path) -> list[Check]:
     return checks
 
 
+def _check_collisions(run_dir: Path) -> list[Check]:
+    """Audit CSP contacts: distinguish low track/curb hits from barriers."""
+    path = run_dir / "camera" / "collision_events.parquet"
+    if not path.exists():
+        return []
+    contacts = pd.read_parquet(path)
+    required = {"collision_with", "collision_position_up"}
+    if not required <= set(contacts):
+        return [Check("collision_contact_audit", False,
+                      "collision_with/position_up 채널 없음")]
+    car = pd.to_numeric(contacts["collision_with"], errors="coerce") > 0
+    up = pd.to_numeric(contacts["collision_position_up"], errors="coerce")
+    low_surface = ~car & (up < 0.20)
+    barrier = ~car & (up >= 0.20)
+    damage_cols = [c for c in contacts if c.startswith("collision_damage_")]
+    damaged = 0
+    if damage_cols:
+        damaged = int(
+            (contacts[damage_cols].fillna(0).abs().max(axis=1) > 0).sum())
+    checks = [Check(
+        "collision_contact_audit", True,
+        "car %d / 낮은 노면·연석 %d / barrier 후보 %d / damage>0 %d"
+        % (int(car.sum()), int(low_surface.sum()), int(barrier.sum()), damaged))]
+    mapping_bad = 0
+    mapping_checked = 0
+    opponent_tables = {}
+    opponent_dir = run_dir / "processed" / "opponent"
+    for table_path in opponent_dir.glob("opp_*_features.parquet"):
+        opponent_id = int(table_path.stem.split("_")[1])
+        opponent_tables[opponent_id] = pd.read_parquet(
+            table_path, columns=["t_img", "distance"])
+    for _, row in contacts.loc[car].iterrows():
+        mapping_checked += 1
+        event_time = float(row["t_img"])
+        decoded_id = int(row["collision_with"]) - 1
+        decoded = opponent_tables.get(decoded_id)
+        if decoded is None or decoded.empty:
+            mapping_bad += 1
+            continue
+        decoded_index = int((decoded["t_img"] - event_time).abs().argmin())
+        residual_ms = (
+            abs(float(decoded["t_img"].iloc[decoded_index]) - event_time) * 1000.0)
+        decoded_distance = float(decoded["distance"].iloc[decoded_index])
+        all_distances = []
+        for table in opponent_tables.values():
+            if table.empty:
+                continue
+            nearest = int((table["t_img"] - event_time).abs().argmin())
+            all_distances.append(float(table["distance"].iloc[nearest]))
+        nearest_distance = min(all_distances) if all_distances else float("inf")
+        if (residual_ms > 50.0 or not np.isfinite(decoded_distance)
+                or decoded_distance > 8.0
+                or decoded_distance > nearest_distance + 1.5):
+            mapping_bad += 1
+    checks.append(Check(
+        "collision_id_mapping_ok", mapping_bad == 0,
+        "CSP collision_with-1 -> opponent_id: %d/%d valid"
+        % (mapping_checked - mapping_bad, mapping_checked)))
+    return checks
+
+
 def validate_run(run_dir: str | Path, dt_tol_ms: float = 1.0) -> dict:
     run_dir = Path(run_dir)
     checks: list[Check] = []
     checks += _check_structure(run_dir, dt_tol_ms=dt_tol_ms)
     checks += _check_export(run_dir)
+    checks += _check_collisions(run_dir)
 
     n_pass = sum(c.passed for c in checks)
     n_fail = len(checks) - n_pass

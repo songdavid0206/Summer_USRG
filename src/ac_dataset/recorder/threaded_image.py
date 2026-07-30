@@ -31,7 +31,7 @@ from .image_logger import ImageLogger
 class ThreadedImageRecorder:
     def __init__(self, run_dir: str | Path, clock, screen,
                  image_hz: float = 50.0, image_ext: str = "jpg",
-                 jpg_quality: int = 95, queue_max: int = 30):
+                 jpg_quality: int = 85, queue_max: int = 30):
         """
         clock  : collect 의 Clock (telemetry 와 같은 시계여야 timestamp 축이 일치).
         screen : ScreenCapture. 캡처 스레드가 단독 소유(dxcam grab 은 한 스레드에서만).

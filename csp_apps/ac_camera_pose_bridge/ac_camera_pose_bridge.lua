@@ -3,9 +3,10 @@
 
 local CAPACITY = 128
 local MAX_CARS = 32
+local COLLISION_CAPACITY = 256
 local MAGIC = 0x41434350 -- "ACCP"
 
-local mmf = ac.writeMemoryMappedFile('AcTools.ACDataset.RenderState.v2', [[
+local mmf = ac.writeMemoryMappedFile('AcTools.ACDataset.RenderState.v3', [[
   uint32_t magic;
   uint32_t version;
   uint32_t capacity;
@@ -46,12 +47,68 @@ local mmf = ac.writeMemoryMappedFile('AcTools.ACDataset.RenderState.v2', [[
   float car_aabb_length[4096];
   float car_aabb_width[4096];
   float car_aabb_height[4096];
+  uint32_t collision_write_index;
+  uint32_t collision_slot_seq[256];
+  int32_t collision_render_frame[256];
+  float collision_sim_time_ms[256];
+  int32_t collision_lap_time_ms[256];
+  int32_t collision_lap_count[256];
+  int32_t collision_car_id[256];
+  int32_t collision_with[256];
+  float collision_depth[256];
+  float collision_pos_forward[256];
+  float collision_pos_right[256];
+  float collision_pos_up[256];
+  float collision_relative_speed_mps[256];
+  float collision_damage[1280];
 ]], false)
 
 mmf.magic = MAGIC
-mmf.version = 2
+mmf.version = 3
 mmf.capacity = CAPACITY
 mmf.write_index = 0
+mmf.collision_write_index = 0
+
+-- Record the physics engine's exact ego collision-start event. `collidedWith`
+-- reserves 0 for no car and otherwise stores the zero-based car index plus 1.
+local collisionSubscription = ac.onCarCollision(0, function(carID)
+  local sim = ac.getSim()
+  local car = ac.getCar(carID)
+  if car == nil then return end
+
+  local n = mmf.collision_write_index
+  local i = n % COLLISION_CAPACITY
+  local seq = n * 2 + 1
+  mmf.collision_slot_seq[i] = seq
+
+  local otherID = car.collidedWith
+  local relativeSpeed = car.speedMs
+  if otherID > 0 then
+    local other = ac.getCar(otherID - 1)
+    if other ~= nil then
+      local dv = car.velocity - other.velocity
+      relativeSpeed = math.sqrt(dv.x * dv.x + dv.y * dv.y + dv.z * dv.z)
+    end
+  end
+  local cp = car.collisionPosition
+  mmf.collision_render_frame[i] = sim.frame
+  mmf.collision_sim_time_ms[i] = sim.time
+  mmf.collision_lap_time_ms[i] = car.lapTimeMs
+  mmf.collision_lap_count[i] = car.lapCount
+  mmf.collision_car_id[i] = carID
+  mmf.collision_with[i] = otherID
+  mmf.collision_depth[i] = car.collisionDepth
+  mmf.collision_pos_forward[i] = cp.z
+  mmf.collision_pos_right[i] = cp.x
+  mmf.collision_pos_up[i] = cp.y
+  mmf.collision_relative_speed_mps[i] = relativeSpeed
+  for zone = 0, 4 do
+    mmf.collision_damage[i * 5 + zone] = car.damage[zone]
+  end
+
+  mmf.collision_slot_seq[i] = seq + 1
+  mmf.collision_write_index = n + 1
+end)
 
 function script.update(dt)
   local sim = ac.getSim()
@@ -108,7 +165,7 @@ end
 
 function script.windowMain()
   ui.text('Actual render camera pose bridge is active.')
-  ui.text(string.format('Render frame: %d  Samples: %d  Cars: %d',
-    ac.getSim().frame, mmf.write_index, ac.getSim().carsCount))
+  ui.text(string.format('Render: %d  Samples: %d  Cars: %d  Collisions: %d',
+    ac.getSim().frame, mmf.write_index, ac.getSim().carsCount, mmf.collision_write_index))
   ui.text('No image pixels are read or used for calibration.')
 end

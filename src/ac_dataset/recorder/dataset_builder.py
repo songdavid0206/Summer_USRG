@@ -68,6 +68,25 @@ def _interp_col(x_new: np.ndarray, x: np.ndarray, y: np.ndarray, angle: bool) ->
     return np.interp(x_new, x, y)
 
 
+def _nearest_col(x_new: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Sample y at the nearest x without creating fractional discrete labels."""
+    right = np.searchsorted(x, x_new).clip(0, len(x) - 1)
+    left = np.maximum(right - 1, 0)
+    nearest = np.where(np.abs(x_new - x[left]) <= np.abs(x[right] - x_new),
+                       left, right)
+    return y[nearest]
+
+
+def _is_nearest_channel(col: str) -> bool:
+    """Channels that must not be linearly interpolated across lap boundaries."""
+    return col.lower() in {
+        "lapcount", "completedlaps", "lapinvalidated",
+        "normalizedsplineposition", "numberoftyresout", "isinpit",
+        "currenttime", "ilasttime", "bestlap",
+        "actualgear", "gear", "done", "out_of_track",
+    }
+
+
 def _mono_gametime(tel: pd.DataFrame):
     """telemetry 에 **단조증가 게임시간(ms)** 축을 만든다.
 
@@ -100,11 +119,32 @@ def _pair_by_gametime(img: pd.DataFrame, tel: pd.DataFrame, tolerance: float) ->
 
     ti = img["t"].to_numpy(float)
     gi = img["game_time_ms"].to_numpy(float)
-    # 각 이미지의 lap_offset: 벽시계 최근접 telemetry 의 lap_off(랩당 상수라 최근접이면 충분).
+    # 이미지의 lap clock은 매 랩 0으로 리셋되므로 같은 game_time_ms가 여러 랩에 존재한다.
+    # 먼저 벽시계로 대략적인 monotonic game time을 구하고, 각 랩의 안정적인 중앙 offset
+    # 후보 중 그 시점에 가장 가까운 랩 주기를 고른다. 벽시계는 랩 주기 선택에만 쓰고,
+    # 주기 안의 정밀 정렬은 game_time_ms가 담당한다.
+    #
+    # 이 선택이 필요한 이유: AC는 결승선에서 game_time_ms, LapCount, completedLaps를
+    # 서로 다른 render/telemetry tick에 갱신할 수 있다. 예를 들어 lap=3, time=3ms가
+    # 세 번째 랩의 시작인지 네 번째 랩 직전 reset tick인지 lap 번호만으로는 모호하다.
     j = np.searchsorted(t_wall, ti).clip(1, len(t_wall) - 1)
     left = j - 1
     near = np.where((ti - t_wall[left]) <= (t_wall[j] - ti), left, j)
-    img_mono = gi + lap_off[near]
+    img_mono = gi + lap_off[near]  # legacy fallback
+    if "completed_laps" in img.columns and "completedLaps" in tel.columns:
+        telemetry_laps = pd.to_numeric(tel["completedLaps"], errors="coerce").to_numpy()
+        stable_offsets = []
+        for lap in np.unique(telemetry_laps[np.isfinite(telemetry_laps)]):
+            offsets = lap_off[telemetry_laps == lap]
+            offsets = offsets[np.isfinite(offsets)]
+            if len(offsets):
+                stable_offsets.append(float(np.median(offsets)))
+        if stable_offsets:
+            offsets = np.asarray(stable_offsets, dtype=float)
+            wall_mono = np.interp(ti, t_wall, mono)
+            candidates = gi[:, None] + offsets[None, :]
+            choice = np.abs(candidates - wall_mono[:, None]).argmin(axis=1)
+            img_mono = candidates[np.arange(len(gi)), choice]
 
     base = img.rename(columns={"t": "t_img"}).reset_index(drop=True)
     # 보간할 telemetry 채널(키/문자열 제외). 나머지(비수치)는 최근접.
@@ -117,11 +157,13 @@ def _pair_by_gametime(img: pd.DataFrame, tel: pd.DataFrame, tolerance: float) ->
     for c in tel_cols:
         col = tel[c]
         if np.issubdtype(col.dtype, np.number):
-            vals = _interp_col(img_mono, mono, col.to_numpy(float), _is_angle(c))
+            values = col.to_numpy(float)
+            vals = (_nearest_col(img_mono, mono, values)
+                    if _is_nearest_channel(c)
+                    else _interp_col(img_mono, mono, values, _is_angle(c)))
             cols[c] = np.where(valid, vals, np.nan)
         else:  # 비수치(플래그/문자열): 게임시간 최근접
-            k = np.searchsorted(mono, img_mono).clip(0, len(mono) - 1)
-            cols[c] = col.to_numpy()[k]
+            cols[c] = _nearest_col(img_mono, mono, col.to_numpy())
     # t_tel(그 게임시간의 telemetry 벽시계, 참고용) + dt.
     # 게임시간 축 밖(범위 초과) 프레임은 t_tel NaN → downstream 에서 drop.
     t_tel = np.where(valid, np.interp(img_mono, mono, t_wall), np.nan)
@@ -260,6 +302,23 @@ def build_dataset(run_dir: str | Path, tolerance: float = 0.05) -> dict:
                                   + [c for c in render_cars.columns if c not in front]]
         _save(render_cars.sort_values(["frame", "car_id"]).reset_index(drop=True),
               cam_dir / "render_car_state")
+
+    # CSP physics callback에서 받은 실제 ego 충돌 시작 이벤트. 이벤트를 처음 읽은
+    # raw 이미지 프레임을 최종 정렬 프레임으로 바꾸고 해당 프레임의 t_img를 붙인다.
+    collision_path = run_dir / "collision_events.parquet"
+    if collision_path.exists() and "raw_frame" in merged.columns:
+        collisions = pd.read_parquet(collision_path)
+        frame_map = merged[["raw_frame", "frame", "t_img"]].drop_duplicates("raw_frame")
+        collisions = collisions.merge(frame_map, left_on="image_frame",
+                                      right_on="raw_frame", how="inner")
+        collisions = collisions.drop(columns=["image_frame", "raw_frame"])
+        front = ["frame", "t_img", "collision_event_seq", "collision_render_frame",
+                 "collision_sim_time_ms", "collision_lap_time_ms",
+                 "collision_lap_count", "collision_car_id", "collision_with"]
+        collisions = collisions[[c for c in front if c in collisions.columns]
+                                + [c for c in collisions.columns if c not in front]]
+        _save(collisions.sort_values(["frame", "collision_event_seq"]).reset_index(drop=True),
+              cam_dir / "collision_events")
 
     # index에 없는 자투리 png 정리(예: Ctrl+C가 저장 직후·기록 직전에 걸려 타임스탬프 없이
     # 남은 마지막 프레임). 정렬된 프레임만 남긴다.

@@ -6,8 +6,7 @@ ego / action / opponent 각 그룹의 필드명을 한 곳에서 관리한다.
 로거(telemetry_logger), 병합(sync), 학습 코드가 모두 여기를 참조하도록 해서
 필드명이 여러 파일에 흩어지지 않게 한다.
 
-키 이름은 참조 레포(dasGringuen/assetto_corsa_gym)의 `ac_env.py` self.state 기준.
-게임에서 실제 state를 한 번 찍어 확인한 뒤 확정한다(아래 TODO).
+키 이름은 참조 레포의 `ac_env.py`와 실제 sensors_par telemetry를 대조해 확정했다.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from __future__ import annotations
 # action(정답 라벨): 사람이 실제로 한 조작값. telemetry에서 '읽기만' 한다.
 #   canonical 이름  ->  레포 state dict의 원본 키
 #   * vjoy로 보내는 게 아니라, 플러그인 telemetry에 담긴 현재 조작값을 라벨로 씀.
-#   TODO(게임 확인): 레포 실제 키명이 accStatus/gas 중 무엇인지, brake 스케일(0~1?) 확정
+#   실측 키: steerAngle / accStatus / brakeStatus. 페달 범위는 0~1.
 # ----------------------------------------------------------------------------
 ACTION_MAP: dict[str, str] = {
     "steer":    "steerAngle",   # 조향 (부호 = 좌/우)
@@ -62,8 +61,7 @@ EGO_KEYS_HINT: list[str] = [
 # ----------------------------------------------------------------------------
 # opponent(상대 차량): 가변 개수(0~N)라 별도 long-format 테이블에 저장.
 #   한 행 = (t, opp_id, <아래 필드들>).  ego 기준 상대좌표를 저장하는 걸 권장.
-#   TODO(게임 확인): AC shared memory에서 상대차 정보가 실제로 뽑히는지 확인.
-#     안 나오면 opponents_raw.parquet 은 그냥 비게 두면 됨(optional).
+#   opponents_server 실측 확인 완료. 상대 없는 solo에서는 테이블이 비어도 정상이다.
 # ----------------------------------------------------------------------------
 OPPONENT_FIELDS: list[str] = [
     "opp_id",             # 상대 차량 식별자 (Opponent['id'])
