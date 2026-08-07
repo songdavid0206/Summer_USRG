@@ -273,3 +273,126 @@ python -m pytest -q
 4. camera-only imitation-learning baseline
 5. Assetto Corsa closed-loop inference
 6. 완주율, 랩타임, 충돌, 트랙 이탈과 라인 오차 기반 실패 분석
+
+## Laguna Seca solo TCP baseline
+
+수집이 끝난 Laguna Seca solo run만 사용해 TCP-style baseline을 준비한다. 원본 TCP의
+trajectory/control 이중 branch는 유지하고, CARLA Roach teacher 전용 value/feature
+distillation은 사용하지 않는다. 미래 waypoint는 40 Hz 기준 0.5, 1.0, 1.5, 2.0초의
+실제 ego 위치이며, target point는 현재 진행 위치에서 AI racing line을 따라 50 m 앞이다.
+고속 레이싱 분포에 맞춰 waypoint와 target point는 50 m, speed 입력과 speed-head 정답은
+90 m/s로 나눈다. 두 스케일은 checkpoint의 `normalization` 메타데이터에도 저장한다.
+
+```powershell
+python -m pip install -e ".[train]"
+python -m ac_dataset.tcp.prepare
+python train.py --batch-size 32 --epochs 50 --imagenet-pretrained
+python evaluate.py --checkpoint training/tcp_lagunaseca/checkpoints/best.pt
+```
+
+standing/flying lap phase를 구분해 학습한 checkpoint의 전체 validation offline 평가는
+prepared dataset과 checkpoint를 모두 phase 버전으로 맞춰 실행한다.
+
+```powershell
+python evaluate.py `
+  --prepared training/tcp_lagunaseca_phase `
+  --checkpoint training/tcp_lagunaseca_phase/checkpoints/best.pt `
+  --output training/tcp_lagunaseca_phase/evaluation
+```
+
+빠른 실행 확인에는 위 명령 끝에 `--max-batches 10`을 추가한다. 실제 평가에는 마지막
+epoch의 `last.pt`가 아니라 validation loss가 가장 낮은 `best.pt`를 사용한다.
+
+`training/`은 대용량 원본 dataset, prepared manifest, checkpoint와 평가 산출물이 들어가는
+로컬 작업 디렉터리이므로 Git에서 제외한다. 따라서 모델 weight는 이 저장소에 포함되지
+않으며, 다른 컴퓨터에서 추론하려면 별도로 전달받은 checkpoint를 위 경로에 두거나
+`--checkpoint`에 실제 위치를 지정해야 한다. 공개 배포가 필요하면 일반 Git 커밋 대신
+GitHub Release asset 또는 Git LFS를 사용한다.
+
+준비 결과는 `training/tcp_lagunaseca/`에 생성된다.
+
+- `manifest.parquet`: 이미지·조작·pose를 합친 학습 index
+- `split.json`: Laguna Seca solo 9-run train / 2-run validation 분할
+- `rgb_qc_samples.parquet`: 약 1 Hz RGB 자동 QC 표본
+- `contact_sheet.jpg`: run별 육안 확인 표본
+- `summary.json`: 세션·프레임·QC 요약
+
+별도 offline test split은 만들지 않는다. 최종 평가는 Laguna Seca closed-loop 주행으로
+수행한다.
+
+학습 후 `evaluate.py`는 전체 validation run을 대상으로 current/future control과 horizon별
+waypoint 오차를 계산하고 `training/tcp_lagunaseca/evaluation/`에 loss curve, track error map,
+RGB+ego-BEV 정성 표본, `predictions.parquet`, `metrics.json`, `REPORT.md`를 생성한다.
+
+### Read-only live shadow inference
+
+폐루프 제어를 연결하기 전에 모델 예측과 운전자의 실제 입력을 실시간으로 비교한다. 아래
+명령은 화면과 telemetry를 읽기만 하며 vJoy/CSP/controller로 값을 보내는 코드가 없다.
+
+```powershell
+python shadow.py --duration 60
+```
+
+기본값은 학습 때와 같은 `0,80,1920,945` 화면 영역, 40 Hz, `best.pt`, Laguna Seca AI
+racing line 50 m lookahead이다. AC 세션에 진입하고 `sensors_par`의 ego UDP server가 켜진
+상태에서 실행한다. 실행 후 5초간 화면 전환 시간을 주고, 차량 속도가 1 m/s 이상으로
+0.25초간 유지될 때 자동으로 기록을 시작한다. 즉시 중단하려면 `Ctrl+C`를 누른다.
+CUDA에서는 학습의 PIL bilinear resize와 수치적으로 동등한 antialiased bilinear resize 및
+ImageNet 정규화를 GPU에서 실행한다. CPU device를 선택하면 기존 PIL 전처리를 사용한다.
+
+결과는 `training/tcp_lagunaseca/shadow/<실행시각>/`에 저장된다.
+
+- `config.json`: checkpoint, capture, normalization 및 `actuation_enabled=false` 안전 설정
+- `first_frame.jpg`: 기록이 실제 시작된 첫 RGB crop(캡처 내용·구간 확인용)
+- `shadow.jsonl`: 매 프레임 예측 steer/signed_accel, 디코드한 throttle/brake, 실제 운전자
+  입력, 두 값의 차이, waypoint/future action, inference/loop 시간
+- `summary.json`: 처리 프레임 수, 실효 Hz, 누락·반복 프레임 수
+
+`signed_accel = throttle - brake`이므로 모델 출력이 양수면 throttle, 음수면 brake로
+해석한다. 이 baseline은 throttle과 brake를 동시에 밟는 상태를 표현하지 못한다.
+추가 시각 디버깅이 필요하면 `--save-frame-every 40`으로 약 1초마다 JPEG를 `frames/`에
+저장할 수 있다. JPEG 저장 지연이 성능 측정에 섞이므로 순수 timing run에서는 생략한다.
+
+### Guarded vJoy closed-loop test
+
+vJoy 2.1.9.1 device 1의 X/Y/Z를 각각 steer/gas/brake로 사용한다. Content Manager의
+`Settings > Assetto Corsa > Controls`에서 input method를 wheel로 바꾸고 세 축을 먼저
+매핑해야 한다. 모델에는 gear 출력이 없으므로 첫 테스트에서는 automatic shifting을 켠다.
+
+독립 watchdog bridge를 별도 터미널에서 먼저 실행한다.
+
+```powershell
+python vjoy_bridge.py
+```
+
+bridge가 vJoy를 소유하며 F8을 누르거나 command packet이 0.15초 끊기면 steer=0,
+throttle=0, brake=1을 latch한다. latch 해제는 bridge 재시작으로만 가능하다.
+
+Content Manager에서 각 binding 칸을 선택한 뒤 필요한 축을 움직인다.
+
+```powershell
+python vjoy_axis_test.py --steer 0.5 --duration 5 --confirm-axis-test
+python vjoy_axis_test.py --throttle 0.5 --duration 5 --confirm-axis-test
+python vjoy_axis_test.py --brake 0.5 --duration 5 --confirm-axis-test
+```
+
+트랙 화면에서 실제 telemetry 규약까지 확인한다.
+
+```powershell
+python vjoy_axis_test.py --steer 0.10 --duration 2 --verify-telemetry --confirm-axis-test
+python vjoy_axis_test.py --throttle 0.20 --duration 2 --verify-telemetry --confirm-axis-test
+python vjoy_axis_test.py --brake 0.20 --duration 2 --verify-telemetry --confirm-axis-test
+```
+
+`telemetry-during`이 각각 steerNorm +0.10, throttle 0.20, brake 0.20 근처인지 확인한다.
+steer만 반대 부호라면 closed-loop에 `--steer-sign -1`을 사용한다. pedal이 반대로 움직이면
+Content Manager에서 해당 축의 invert 설정을 바꾼다.
+
+첫 모델 제어는 다음 제한 profile로만 실행한다.
+
+```powershell
+python closed_loop.py --duration 10 --confirm-vjoy-mapped
+```
+
+기본 제한은 steer +/-0.20, throttle <=0.30, speed <=20m/s이며 track-out 시 bridge
+emergency를 latch한다. F8을 먼저 실제로 시험하고, 축 부호 확인 전에는 제한을 풀지 않는다.

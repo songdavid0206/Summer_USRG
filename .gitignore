@@ -1,6 +1,7 @@
 # 수집된 데이터셋(대용량 이미지/parquet) — 코드 백업 대상 아님
 dataset/
 dataset_v2/
+training/
 
 # 파이썬 캐시
 __pycache__/
