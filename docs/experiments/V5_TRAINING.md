@@ -18,31 +18,31 @@ Key invariants:
 Prepared-data audit (already generated once):
 
 ```powershell
-python audit_v5.py --prepared training/tcp_lagunaseca_v5
+python scripts/experiments/audit_v5.py --prepared training/tcp_lagunaseca_v5
 ```
 
 Optional 100-batch CUDA smoke test:
 
 ```powershell
-python train_v5.py --prepared training/tcp_lagunaseca_v5 --output training/tcp_lagunaseca_v5/smoke_checkpoints --epochs 1 --planner-warmup-epochs 1 --batch-size 32 --workers 16 --max-train-batches 100 --no-require-causal-probe --amp
+python scripts/experiments/train_v5.py --prepared training/tcp_lagunaseca_v5 --output training/tcp_lagunaseca_v5/smoke_checkpoints --epochs 1 --planner-warmup-epochs 1 --batch-size 32 --workers 16 --max-train-batches 100 --no-require-causal-probe --amp
 ```
 
 Full training from ImageNet initialization (not v4):
 
 ```powershell
-python train_v5.py --prepared training/tcp_lagunaseca_v5 --output training/tcp_lagunaseca_v5/checkpoints --epochs 50 --planner-warmup-epochs 5 --batch-size 32 --workers 16 --lr 1e-4 --weight-decay 1e-5 --imagenet-pretrained --balanced-sampler --amp --early-stopping-patience 8
+python scripts/experiments/train_v5.py --prepared training/tcp_lagunaseca_v5 --output training/tcp_lagunaseca_v5/checkpoints --epochs 50 --planner-warmup-epochs 5 --batch-size 32 --workers 16 --lr 1e-4 --weight-decay 1e-5 --imagenet-pretrained --balanced-sampler --amp --early-stopping-patience 8
 ```
 
 Resume after an interruption (same output directory):
 
 ```powershell
-python train_v5.py --prepared training/tcp_lagunaseca_v5 --output training/tcp_lagunaseca_v5/checkpoints --epochs 50 --planner-warmup-epochs 5 --batch-size 32 --workers 16 --lr 1e-4 --weight-decay 1e-5 --balanced-sampler --amp --early-stopping-patience 8 --resume training/tcp_lagunaseca_v5/checkpoints/last.pt
+python scripts/experiments/train_v5.py --prepared training/tcp_lagunaseca_v5 --output training/tcp_lagunaseca_v5/checkpoints --epochs 50 --planner-warmup-epochs 5 --batch-size 32 --workers 16 --lr 1e-4 --weight-decay 1e-5 --balanced-sampler --amp --early-stopping-patience 8 --resume training/tcp_lagunaseca_v5/checkpoints/last.pt
 ```
 
 Offline evaluation and the full causal go/no-go gate:
 
 ```powershell
-python evaluate_v5.py --prepared training/tcp_lagunaseca_v5 --checkpoint training/tcp_lagunaseca_v5/checkpoints/best.pt --output training/tcp_lagunaseca_v5/evaluation --workers 16
+python scripts/experiments/evaluate_v5.py --prepared training/tcp_lagunaseca_v5 --checkpoint training/tcp_lagunaseca_v5/checkpoints/best.pt --output training/tcp_lagunaseca_v5/evaluation --workers 16
 ```
 
 Only when `closed_loop_allowed` is true, use the normal `shadow.py` and

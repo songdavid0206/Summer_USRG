@@ -292,12 +292,12 @@ Racing line은 track에 저장된 정적 route prior다. 미래 실제 ego waypo
 대용량 dataset과 prepared manifest는 저장소에 포함되지 않는다. 먼저 로컬 `dataset_v2`와 기존 normal prepared data가 필요하다.
 
 ```powershell
-python prepare_v4.py `
+python scripts/experiments/prepare_v4.py `
   --dataset-v2 dataset_v2 `
   --normal-prepared training/tcp_lagunaseca_v3_dense `
   --output training/tcp_lagunaseca_v4
 
-python audit_v4.py --prepared training/tcp_lagunaseca_v4
+python scripts/experiments/audit_v4.py --prepared training/tcp_lagunaseca_v4
 ```
 
 학습:
@@ -505,10 +505,10 @@ training/tcp_lagunaseca_v4/closed_loop/<timestamp>/
 시각화 도구:
 
 ```powershell
-python visualize_closed_loop.py --help
-python scrub_waypoints.py --help
-python viz_waypoints_offline.py --help
-python visualize_racing_line_alignment.py --help
+python tools/visualize_closed_loop.py --help
+python tools/scrub_waypoints.py --help
+python tools/viz_waypoints_offline.py --help
+python tools/visualize_racing_line_alignment.py --help
 ```
 
 ## 저장소 구조
@@ -522,15 +522,11 @@ Summer_USRG/
 ├─ configs/                 # Ferrari SF15-T steering calibration
 ├─ analysis/                # Dataset 분포 분석
 ├─ docs/images/             # README용 검증 이미지
+├─ docs/experiments/        # V4~V8 실험 절차와 원인 감사 기록
+├─ scripts/experiments/     # 버전별 prepare/train/evaluate 실행 진입점
 ├─ tests/                   # Unit tests
 ├─ tools/                   # Export, analysis, installer 보조 코드
 ├─ SETUP.md                 # Assetto Corsa/CSP 설치
-├─ V4_TRAINING.md
-├─ V5_TRAINING.md
-├─ V6_TRAINING.md
-├─ V6_ROOT_CAUSE_AUDIT.md
-├─ V7_TRAINING.md
-├─ V8_TRAINING.md
 └─ README.md
 ```
 

@@ -68,8 +68,8 @@ resize한 후 train-only 색상 augmentation을 적용한다. 공유 live 전처
 prepare와 감사는 이미 완료되어 있다. 다시 만들거나 검증하려면:
 
 ```powershell
-python prepare_v4.py --dataset-v2 dataset_v2 --normal-prepared training/tcp_lagunaseca_v3_dense --output training/tcp_lagunaseca_v4
-python audit_v4.py --prepared training/tcp_lagunaseca_v4
+python scripts/experiments/prepare_v4.py --dataset-v2 dataset_v2 --normal-prepared training/tcp_lagunaseca_v3_dense --output training/tcp_lagunaseca_v4
+python scripts/experiments/audit_v4.py --prepared training/tcp_lagunaseca_v4
 ```
 
 본 학습:

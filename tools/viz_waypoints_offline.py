@@ -14,9 +14,9 @@ Keys (interactive window):
     q                 quit
 
 Usage:
-    python viz_waypoints_offline.py --prepared training/tcp_lagunaseca_v8
-    python viz_waypoints_offline.py --prepared training/tcp_lagunaseca_v8 --split train
-    python viz_waypoints_offline.py --prepared training/tcp_lagunaseca_v8 --save-frame 0
+    python tools/viz_waypoints_offline.py --prepared training/tcp_lagunaseca_v8
+    python tools/viz_waypoints_offline.py --prepared training/tcp_lagunaseca_v8 --split train
+    python tools/viz_waypoints_offline.py --prepared training/tcp_lagunaseca_v8 --save-frame 0
 """
 from __future__ import annotations
 

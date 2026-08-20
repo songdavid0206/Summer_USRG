@@ -30,9 +30,9 @@
 ## Commands
 
 ```powershell
-python audit_v8.py --prepared training/tcp_lagunaseca_v8
+python scripts/experiments/audit_v8.py --prepared training/tcp_lagunaseca_v8
 
-python train_v8.py --prepared training/tcp_lagunaseca_v8 --output training/tcp_lagunaseca_v8/checkpoints --tensorboard-dir training/tcp_lagunaseca_v8/tensorboard --epochs 1000 --batch-size 32 --workers 16 --lr 1e-4 --weight-decay 1e-5 --imagenet-pretrained --amp --early-stopping-patience 0 --checkpoint-every 0
+python scripts/experiments/train_v8.py --prepared training/tcp_lagunaseca_v8 --output training/tcp_lagunaseca_v8/checkpoints --tensorboard-dir training/tcp_lagunaseca_v8/tensorboard --epochs 1000 --batch-size 32 --workers 16 --lr 1e-4 --weight-decay 1e-5 --imagenet-pretrained --amp --early-stopping-patience 0 --checkpoint-every 0
 ```
 
 In a second PowerShell window:

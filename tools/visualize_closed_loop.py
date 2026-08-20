@@ -14,7 +14,7 @@ fine and the steering actuation is too weak; if the blue waypoints themselves ru
 wide with the car, the model is the cause.
 
 Usage:
-    python visualize_closed_loop.py --prepared training/tcp_lagunaseca_v4 \
+    python tools/visualize_closed_loop.py --prepared training/tcp_lagunaseca_v4 \
         [--run <run_dir>] [--corner 0.08 0.13 --corner 0.13 0.17]
 """
 from __future__ import annotations

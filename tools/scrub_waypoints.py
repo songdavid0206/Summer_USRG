@@ -13,8 +13,8 @@ Keys:
     q                   quit
 
 Usage:
-    python scrub_waypoints.py --prepared training/tcp_lagunaseca_v4
-    python scrub_waypoints.py --prepared training/tcp_lagunaseca_v4 --run <dir> --window 70
+    python tools/scrub_waypoints.py --prepared training/tcp_lagunaseca_v4
+    python tools/scrub_waypoints.py --prepared training/tcp_lagunaseca_v4 --run <dir> --window 70
 """
 from __future__ import annotations
 
