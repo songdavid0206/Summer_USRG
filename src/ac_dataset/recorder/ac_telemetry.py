@@ -43,6 +43,7 @@ class ACTelemetrySource:
         self._running = False
         self._lock = threading.Lock()
         self._latest: dict | None = None
+        self._latest_received_perf_ns: int | None = None
         self._count = 0
 
     def start(self) -> "ACTelemetrySource":
@@ -67,6 +68,7 @@ class ACTelemetrySource:
         while self._running:
             try:
                 data, _ = self._sock.recvfrom(MAX_MSG_SIZE)
+                received_ns = time.perf_counter_ns()
             except socket.timeout:
                 continue
             except OSError:
@@ -78,12 +80,19 @@ class ACTelemetrySource:
             if isinstance(d, dict):
                 with self._lock:
                     self._latest = d
+                    self._latest_received_perf_ns = received_ns
                     self._count += 1
 
     def latest_state(self) -> dict | None:
         """가장 최근에 받은 state dict의 복사본. 아직 없으면 None."""
         with self._lock:
             return None if self._latest is None else dict(self._latest)
+
+    def latest_state_with_meta(self) -> tuple[dict | None, int | None, int]:
+        """Return state, local receive timestamp, and monotonically increasing count."""
+        with self._lock:
+            state = None if self._latest is None else dict(self._latest)
+            return state, self._latest_received_perf_ns, self._count
 
     def wait_first(self, timeout: float = 5.0) -> bool:
         """첫 state를 받을 때까지 대기. 받으면 True."""

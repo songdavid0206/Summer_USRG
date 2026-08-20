@@ -26,6 +26,7 @@ train = [
     "torch>=2.2",
     "torchvision>=0.17",
     "matplotlib>=3.7",
+    "tensorboard>=2.15",
 ]
 
 [project.scripts]
@@ -44,6 +45,7 @@ ac-evaluate-tcp = "ac_dataset.tcp.evaluate:main"
 ac-shadow-tcp = "ac_dataset.tcp.shadow:main"
 ac-vjoy-bridge = "ac_dataset.control.bridge:main"
 ac-vjoy-axis-test = "ac_dataset.control.axis_test:main"
+ac-vjoy-latency-probe = "ac_dataset.control.latency_probe:main"
 ac-closed-loop-tcp = "ac_dataset.tcp.closed_loop:main"
 
 [tool.setuptools.packages.find]

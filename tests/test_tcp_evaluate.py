@@ -2,7 +2,9 @@ import unittest
 
 import pandas as pd
 
-from ac_dataset.tcp.evaluate import prediction_metrics, qualitative_indices, training_summary
+from ac_dataset.tcp.evaluate import (
+    HORIZONS, prediction_metrics, qualitative_indices, training_summary,
+)
 
 
 class TCPEvaluateTests(unittest.TestCase):
@@ -18,23 +20,26 @@ class TCPEvaluateTests(unittest.TestCase):
         self.assertEqual(summary["last_epoch"], 2)
 
     def test_prediction_metrics_reconstructs_weighted_loss(self):
-        rows = {"gt_signed_accel": [0.0], "pred_signed_accel": [.2],
-                "gt_steer": [0.0], "pred_steer": [.4],
+        rows = {"gt_steer": [0.0], "pred_steer": [.4],
+                "gt_throttle": [0.0], "pred_throttle": [.2],
+                "gt_brake": [0.0], "pred_brake": [.1],
                 "speed_mps": [0.0], "pred_speed_mps": [9.0]}
-        for step in range(1, 5):
+        for step in range(1, len(HORIZONS) + 1):
             rows[f"gt_wp{step}_lateral_m"] = [0.0]
             rows[f"pred_wp{step}_lateral_m"] = [5.0]
             rows[f"gt_wp{step}_forward_m"] = [0.0]
             rows[f"pred_wp{step}_forward_m"] = [5.0]
-            rows[f"gt_future{step}_signed_accel"] = [0.0]
-            rows[f"pred_future{step}_signed_accel"] = [.2]
             rows[f"gt_future{step}_steer"] = [0.0]
             rows[f"pred_future{step}_steer"] = [.4]
-        checkpoint = {"epoch": 1, "val_loss": .555,
-                      "normalization": {"position_scale_m": 50.0, "speed_scale_mps": 90.0}}
+            rows[f"gt_future{step}_throttle"] = [0.0]
+            rows[f"pred_future{step}_throttle"] = [.2]
+            rows[f"gt_future{step}_brake"] = [0.0]
+            rows[f"pred_future{step}_brake"] = [.1]
+        checkpoint = {"epoch": 1, "val_loss": 1.155,
+                      "normalization": {}}
         metrics = prediction_metrics(pd.DataFrame(rows), checkpoint)
-        # .3 action + .1 waypoint + .5*.3 future + .05*.1 speed
-        self.assertAlmostEqual(metrics["recomputed_validation_loss"]["total"], .555)
+        # .7 controls + .1 waypoint + .5*.7 future + .05*.1 speed
+        self.assertAlmostEqual(metrics["recomputed_validation_loss"]["total"], 1.155)
 
     def test_qualitative_indices_are_valid(self):
         table = pd.DataFrame({"combined_error_score": [3.0, 1.0, 2.0],

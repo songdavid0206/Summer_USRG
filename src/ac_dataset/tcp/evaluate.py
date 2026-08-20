@@ -10,11 +10,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import POSITION_SCALE_M, SPEED_SCALE_MPS, normalization_metadata
+from .config import (
+    PLANNING_HORIZONS_SECONDS, POSITION_SCALE_M, SPEED_SCALE_MPS,
+    model_schema_metadata, normalization_metadata, target_speed_input_width,
+)
 from .data import TCPDataset, quaternion_yaw
 
 
-HORIZONS = (0.5, 1.0, 1.5, 2.0)
+HORIZONS = PLANNING_HORIZONS_SECONDS
 
 
 def training_summary(history: list[dict]) -> dict:
@@ -23,7 +26,8 @@ def training_summary(history: list[dict]) -> dict:
     best = min(history, key=lambda row: float(row["val"]["total"]))
     tail = [float(row["val"]["total"]) for row in history[-20:]]
     components = {}
-    for name in ("total", "action", "waypoint", "future_action", "speed"):
+    metric_names = [name for name in history[0]["val"] if name != "total"]
+    for name in ("total", *metric_names):
         row = min(history, key=lambda item: float(item["val"][name]))
         components[name] = {"epoch": int(row["epoch"]), "value": float(row["val"][name])}
     return {
@@ -54,8 +58,9 @@ def plot_history(history: list[dict], output: Path) -> dict:
     ax.grid(alpha=.25); ax.legend(); fig.tight_layout()
     fig.savefig(output / "loss_curves.png", dpi=160); plt.close(fig)
 
+    shown = ("control", "waypoint", "future_control", "speed")
     fig, axes = plt.subplots(2, 2, figsize=(13, 9), sharex=True)
-    for ax, name in zip(axes.flat, ("action", "waypoint", "future_action", "speed")):
+    for ax, name in zip(axes.flat, shown):
         ax.plot(x, [r["train"][name] for r in history], label="train")
         ax.plot(x, [r["val"][name] for r in history], label="validation")
         ax.axvline(best, color="tab:green", ls="--", alpha=.6)
@@ -78,39 +83,47 @@ def _mae_bias(pred, gt) -> dict[str, float]:
 
 
 def prediction_metrics(table: pd.DataFrame, checkpoint: dict) -> dict:
-    accel = _mae_bias(table.pred_signed_accel, table.gt_signed_accel)
     steer = _mae_bias(table.pred_steer, table.gt_steer)
+    throttle = _mae_bias(table.pred_throttle, table.gt_throttle)
+    brake = _mae_bias(table.pred_brake, table.gt_brake)
     speed = _mae_bias(table.pred_speed_mps, table.speed_mps)
     horizons, wp_abs, future_abs = [], [], []
     for step, seconds in enumerate(HORIZONS, 1):
         le = table[f"pred_wp{step}_lateral_m"] - table[f"gt_wp{step}_lateral_m"]
         fe = table[f"pred_wp{step}_forward_m"] - table[f"gt_wp{step}_forward_m"]
-        ae = table[f"pred_future{step}_signed_accel"] - table[f"gt_future{step}_signed_accel"]
         se = table[f"pred_future{step}_steer"] - table[f"gt_future{step}_steer"]
+        te = table[f"pred_future{step}_throttle"] - table[f"gt_future{step}_throttle"]
+        be = table[f"pred_future{step}_brake"] - table[f"gt_future{step}_brake"]
         wp_abs += [np.abs(le).to_numpy(), np.abs(fe).to_numpy()]
-        future_abs += [np.abs(ae).to_numpy(), np.abs(se).to_numpy()]
+        future_abs.append(np.column_stack((np.abs(se), np.abs(te), np.abs(be))))
         horizons.append({
             "step": step, "seconds": seconds,
             "waypoint_lateral_mae_m": float(np.abs(le).mean()),
             "waypoint_forward_mae_m": float(np.abs(fe).mean()),
             "waypoint_euclidean_mean_m": float(np.hypot(le, fe).mean()),
-            "future_signed_accel_mae": float(np.abs(ae).mean()),
             "future_steer_mae": float(np.abs(se).mean()),
+            "future_throttle_mae": float(np.abs(te).mean()),
+            "future_brake_mae": float(np.abs(be).mean()),
         })
-    action_loss = (accel["mae"] + steer["mae"]) / 2
-    waypoint_loss = float(np.concatenate(wp_abs).mean()) / POSITION_SCALE_M
-    future_loss = float(np.concatenate(future_abs).mean())
+    control_loss = steer["mae"] + throttle["mae"] + brake["mae"]
+    waypoint_loss = float(np.nanmean(np.concatenate(wp_abs))) / POSITION_SCALE_M
+    future_by_control = np.nanmean(np.concatenate(future_abs, axis=0), axis=0)
+    future_loss = float(future_by_control.sum())
     speed_loss = speed["mae"] / SPEED_SCALE_MPS
-    total = action_loss + waypoint_loss + .5 * future_loss + .05 * speed_loss
+    pedal_overlap = float((table.pred_throttle * table.pred_brake).mean())
+    speed_weight = float(checkpoint.get("speed_loss_weight", .05))
+    total = control_loss + waypoint_loss + .5 * future_loss + speed_weight * speed_loss
     return {
         "samples": int(len(table)), "checkpoint_epoch": int(checkpoint["epoch"]),
         "checkpoint_val_loss": float(checkpoint["val_loss"]),
         "normalization": checkpoint["normalization"],
-        "current_action": {"signed_accel": accel, "steer": steer},
+        "current_controls": {"steer": steer, "throttle": throttle, "brake": brake},
         "speed_mps": speed, "horizons": horizons,
         "recomputed_validation_loss": {
-            "total": total, "action": action_loss, "waypoint": waypoint_loss,
-            "future_action": future_loss, "speed": speed_loss,
+            "total": total, "control": control_loss, "waypoint": waypoint_loss,
+            "future_control": future_loss, "speed": speed_loss,
+            "speed_weight": speed_weight,
+            "predicted_pedal_overlap": pedal_overlap,
             "checkpoint_total_difference": total - float(checkpoint["val_loss"]),
         },
     }
@@ -118,25 +131,30 @@ def prediction_metrics(table: pd.DataFrame, checkpoint: dict) -> dict:
 
 def _prediction_table(meta: pd.DataFrame, pred: dict, gt: dict) -> pd.DataFrame:
     out = meta.reset_index(drop=True).copy()
-    out["gt_signed_accel"], out["gt_steer"] = gt["action"][:, 0], gt["action"][:, 1]
-    out["pred_signed_accel"], out["pred_steer"] = pred["action"][:, 0], pred["action"][:, 1]
+    for index, name in enumerate(("steer", "throttle", "brake")):
+        out[f"gt_{name}"] = gt["controls"][:, index]
+        out[f"pred_{name}"] = pred["controls"][:, index]
+    out["gt_signed_accel"] = out.gt_throttle - out.gt_brake
+    out["pred_signed_accel"] = out.pred_throttle - out.pred_brake
     out["pred_speed_mps"] = pred["speed"][:, 0] * SPEED_SCALE_MPS
-    out["action_abs_error"] = (np.abs(out.pred_signed_accel - out.gt_signed_accel)
-                               + np.abs(out.pred_steer - out.gt_steer)) / 2
+    out["action_abs_error"] = np.column_stack([
+        np.abs(out[f"pred_{name}"] - out[f"gt_{name}"])
+        for name in ("steer", "throttle", "brake")]).mean(axis=1)
     wp_errors = []
-    for step in range(1, 5):
+    for step in range(1, len(HORIZONS) + 1):
         j = step - 1
+        valid = gt.get("future_mask", np.ones(gt["waypoints"].shape[:2], bool))[:, j] > .5
         for axis, name in enumerate(("lateral", "forward")):
             out[f"gt_wp{step}_{name}_m"] = gt["waypoints"][:, j, axis] * POSITION_SCALE_M
             out[f"pred_wp{step}_{name}_m"] = pred["waypoints"][:, j, axis] * POSITION_SCALE_M
-        le = out[f"pred_wp{step}_lateral_m"] - out[f"gt_wp{step}_lateral_m"]
-        fe = out[f"pred_wp{step}_forward_m"] - out[f"gt_wp{step}_forward_m"]
+        le = (out[f"pred_wp{step}_lateral_m"] - out[f"gt_wp{step}_lateral_m"]).where(valid, np.nan)
+        fe = (out[f"pred_wp{step}_forward_m"] - out[f"gt_wp{step}_forward_m"]).where(valid, np.nan)
         out[f"wp{step}_error_m"] = np.hypot(le, fe); wp_errors.append(out[f"wp{step}_error_m"])
-        out[f"gt_future{step}_signed_accel"] = gt["future_actions"][:, j, 0]
-        out[f"gt_future{step}_steer"] = gt["future_actions"][:, j, 1]
-        out[f"pred_future{step}_signed_accel"] = pred["future_actions"][:, j, 0]
-        out[f"pred_future{step}_steer"] = pred["future_actions"][:, j, 1]
-    out["waypoint_mean_error_m"] = np.column_stack(wp_errors).mean(axis=1)
+        for control_index, name in enumerate(("steer", "throttle", "brake")):
+            out[f"gt_future{step}_{name}"] = gt["future_controls"][:, j, control_index]
+            out[f"pred_future{step}_{name}"] = pred["future_controls"][:, j, control_index]
+            out.loc[~valid, [f"gt_future{step}_{name}", f"pred_future{step}_{name}"]] = np.nan
+    out["waypoint_mean_error_m"] = np.nanmean(np.column_stack(wp_errors), axis=1)
     out["combined_error_score"] = out.action_abs_error + out.waypoint_mean_error_m / 50
     return out
 
@@ -148,20 +166,30 @@ def run_inference(prepared: Path, checkpoint_path: Path, batch_size: int,
     from .model import build_model
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if checkpoint.get("normalization") != normalization_metadata():
+    checkpoint_schema = checkpoint.get("model_schema")
+    target_width = target_speed_input_width(checkpoint_schema)
+    prepared_schema = json.loads((prepared / "schema.json").read_text(encoding="utf-8"))
+    if checkpoint.get("normalization") != prepared_schema["normalization"]:
         raise RuntimeError(f"normalization mismatch: {checkpoint.get('normalization')}")
+    if checkpoint_schema != prepared_schema["model_schema"]:
+        raise RuntimeError("checkpoint model schema mismatch; v2 retraining is required")
     device = torch.device(device_name if device_name != "auto"
                           else ("cuda" if torch.cuda.is_available() else "cpu"))
     dataset = TCPDataset(prepared, "val", augment=False)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers,
                         pin_memory=device.type == "cuda")
-    model = build_model(False).to(device); model.load_state_dict(checkpoint["model"]); model.eval()
-    names = ("waypoints", "action", "future_actions", "speed")
-    pred = {n: [] for n in names}; gt = {n: [] for n in names[:-1]}; seen = 0
+    model = build_model(False, pred_len=len(dataset.offsets),
+                        target_speed_width=target_width).to(device)
+    model.load_state_dict(checkpoint["model"]); model.eval()
+    names = ("waypoints", "controls", "future_controls", "speed")
+    pred = {n: [] for n in names}
+    gt = {n: [] for n in names[:-1] + ("future_mask",)}
+    seen = 0
     with torch.no_grad():
         for batch_no, batch in enumerate(loader, 1):
             gpu = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            result = model(gpu["image"], gpu["speed"], gpu["target_point"], gpu["command"])
+            result = model(gpu["image"], gpu["ego"], gpu["racing_line"], gpu["command"],
+                           gpu["target_speed"] if target_width else None)
             for n in names: pred[n].append(result[n].cpu().numpy())
             for n in gt: gt[n].append(batch[n].numpy())
             seen += len(batch["image"])
@@ -174,6 +202,8 @@ def run_inference(prepared: Path, checkpoint_path: Path, batch_size: int,
     cols = ["session", "run_id", "weather", "lap", "time_ms", "source_index",
             "spline_position", "image_path", "pos_x", "pos_y", "pos_z", "quat_x",
             "quat_y", "quat_z", "quat_w", "speed_mps", "throttle", "brake", "steer"]
+    cols += [name for name in ("trajectory_id", "source_type", "recovery_severity")
+             if name in dataset.samples.columns]
     table = _prediction_table(dataset.samples.iloc[:seen][cols], pred, gt)
     return dataset, checkpoint, table, str(device)
 
@@ -250,6 +280,8 @@ def audit_predictions(table: pd.DataFrame, output: Path) -> dict:
             "action_abs_error": float(group.action_abs_error.mean()),
             "waypoint_mean_error_m": float(group.waypoint_mean_error_m.mean()),
             "steer_mae": float(np.abs(group.pred_steer - group.gt_steer).mean()),
+            "throttle_mae": float(np.abs(group.pred_throttle - group.gt_throttle).mean()),
+            "brake_mae": float(np.abs(group.pred_brake - group.gt_brake).mean()),
             "signed_accel_mae": float(np.abs(group.pred_signed_accel - group.gt_signed_accel).mean()),
         })
     pd.DataFrame(sessions).to_csv(output / "error_by_session.csv", index=False)
@@ -319,9 +351,14 @@ def _project(row, points, z, camera):
 
 
 def _future_z(dataset, row):
-    return np.array([dataset.table.iloc[dataset.lookup[
-        (row.session, int(row.lap), int(row.time_ms) + off * 25)]].pos_z
-        for off in dataset.offsets], float)
+    trajectory = getattr(row, "trajectory_id",
+                         f"{row.session}/lap_{int(row.lap):02d}")
+    values = []
+    for offset in dataset.offsets:
+        found = dataset.lookup.get((str(trajectory), int(row.time_ms) + offset * 25))
+        values.append(float(row.pos_z) if found is None
+                      else float(dataset.table.iloc[found].pos_z))
+    return np.asarray(values, float)
 
 
 def qualitative_indices(table: pd.DataFrame, count: int) -> dict[str, list[int]]:
@@ -354,8 +391,10 @@ def qualitative_sheet(table, dataset, indices, path, title):
     for slot, idx in enumerate(indices):
         row = table.iloc[idx]; image_ax, bev_ax = axes[slot // 2, (slot % 2) * 2:(slot % 2) * 2 + 2]
         with Image.open(row.image_path) as image: image_ax.imshow(image.convert("RGB"))
-        gt = np.array([[row[f"gt_wp{k}_lateral_m"], row[f"gt_wp{k}_forward_m"]] for k in range(1, 5)])
-        pred = np.array([[row[f"pred_wp{k}_lateral_m"], row[f"pred_wp{k}_forward_m"]] for k in range(1, 5)])
+        gt = np.array([[row[f"gt_wp{k}_lateral_m"], row[f"gt_wp{k}_forward_m"]]
+                       for k in range(1, len(HORIZONS) + 1)])
+        pred = np.array([[row[f"pred_wp{k}_lateral_m"], row[f"pred_wp{k}_forward_m"]]
+                         for k in range(1, len(HORIZONS) + 1)])
         z, camera = _future_z(dataset, row), cache.get(row)
         for points, color, label in ((gt, "lime", "GT"), (pred, "red", "prediction")):
             uv = _project(row, points, z, camera)
@@ -381,13 +420,14 @@ def write_report(output, metrics, training, device):
              f"- checkpoint epoch: {metrics['checkpoint_epoch']}", f"- samples: {metrics['samples']:,}",
              f"- device: `{device}`", f"- recomputed/checkpoint val total: {loss['total']:.9f} / {metrics['checkpoint_val_loss']:.9f}",
              "", "## Current output", "",
-             f"- signed acceleration MAE/bias: {metrics['current_action']['signed_accel']['mae']:.6f} / {metrics['current_action']['signed_accel']['bias']:+.6f}",
-             f"- steer MAE/bias: {metrics['current_action']['steer']['mae']:.6f} / {metrics['current_action']['steer']['bias']:+.6f}",
+             f"- steer MAE/bias: {metrics['current_controls']['steer']['mae']:.6f} / {metrics['current_controls']['steer']['bias']:+.6f}",
+             f"- throttle MAE/bias: {metrics['current_controls']['throttle']['mae']:.6f} / {metrics['current_controls']['throttle']['bias']:+.6f}",
+             f"- brake MAE/bias: {metrics['current_controls']['brake']['mae']:.6f} / {metrics['current_controls']['brake']['bias']:+.6f}",
              f"- speed MAE: {metrics['speed_mps']['mae']:.3f} m/s ({metrics['speed_mps']['mae']*3.6:.2f} km/h)", "",
-             "## Horizon metrics", "", "| horizon | lateral m | forward m | 2D m | future accel | future steer |",
-             "|---:|---:|---:|---:|---:|---:|"]
+             "## Horizon metrics", "", "| horizon | lateral m | forward m | 2D m | steer | throttle | brake |",
+             "|---:|---:|---:|---:|---:|---:|---:|"]
     for r in metrics["horizons"]:
-        lines.append(f"| {r['seconds']:.1f}s | {r['waypoint_lateral_mae_m']:.3f} | {r['waypoint_forward_mae_m']:.3f} | {r['waypoint_euclidean_mean_m']:.3f} | {r['future_signed_accel_mae']:.4f} | {r['future_steer_mae']:.4f} |")
+        lines.append(f"| {r['seconds']:.1f}s | {r['waypoint_lateral_mae_m']:.3f} | {r['waypoint_forward_mae_m']:.3f} | {r['waypoint_euclidean_mean_m']:.3f} | {r['future_steer_mae']:.4f} | {r['future_throttle_mae']:.4f} | {r['future_brake_mae']:.4f} |")
     diag = metrics.get("diagnostics", {})
     lines += ["", "## Diagnostics", ""]
     if diag:

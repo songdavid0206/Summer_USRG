@@ -17,8 +17,14 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 
+from .config import (
+    FUTURE_OFFSETS_FRAMES, RACING_LINE_LOOKAHEADS_M,
+    model_schema_metadata, normalization_metadata,
+)
+from .data import add_temporal_ego_features, racing_line_columns
 
-DEFAULT_FUTURE_OFFSETS = (20, 40, 60, 80)  # 0.5, 1.0, 1.5, 2.0 s at 40 Hz
+
+DEFAULT_FUTURE_OFFSETS = FUTURE_OFFSETS_FRAMES
 MIN_SESSION_NAME = "20260724_141917_lagunaseca_ferrarisf15t_solo_40hz"
 VAL_SESSIONS = {
     "20260724_154559_lagunaseca_ferrarisf15t_clear_solo_40hz",
@@ -42,18 +48,29 @@ def parse_ego_info(path: Path) -> dict[str, float]:
             continue
         key, raw = line.split(":", 1)
         values[key.strip()] = [float(item) for item in raw.split()]
-    required = {"position", "orientation", "velocity", "throttle", "brake", "steer_angle"}
+    required = {
+        "position", "orientation", "velocity", "angular_velocity",
+        "acceleration", "throttle", "brake", "steer_angle",
+    }
     missing = required - values.keys()
     if missing:
         raise ValueError(f"{path}: missing fields {sorted(missing)}")
     p, q, v = values["position"], values["orientation"], values["velocity"]
-    if len(p) != 3 or len(q) != 4 or len(v) != 3:
+    angular, acceleration = values["angular_velocity"], values["acceleration"]
+    if (len(p) != 3 or len(q) != 4 or len(v) != 3
+            or len(angular) != 3 or len(acceleration) != 3):
         raise ValueError(f"{path}: invalid vector length")
     return {
         "pos_x": p[0], "pos_y": p[1], "pos_z": p[2],
         "quat_x": q[0], "quat_y": q[1], "quat_z": q[2], "quat_w": q[3],
         "vel_x": v[0], "vel_y": v[1], "vel_z": v[2],
         "speed_mps": float(math.sqrt(sum(item * item for item in v))),
+        "longitudinal_speed_mps": v[0],
+        "lateral_speed_mps": v[1],
+        # EGO_INFO stores (roll, pitch, yaw) in deg/s.
+        "yaw_rate_rad_s": math.radians(angular[2]),
+        "longitudinal_accel_mps2": acceleration[0],
+        "lateral_accel_mps2": acceleration[1],
         "throttle": values["throttle"][0],
         "brake": values["brake"][0],
         "steer": values["steer_angle"][0],
@@ -75,6 +92,52 @@ def discover_sessions(dataset_v2: Path) -> list[Path]:
         if info.get("mode") == "solo" and info.get("track") == "ks_laguna_seca":
             sessions.append(path)
     return sessions
+
+
+def add_racing_line_targets(manifest: pd.DataFrame) -> pd.DataFrame:
+    """Store global line samples for each lookahead; Dataset converts them local."""
+    result = manifest.copy()
+    columns = racing_line_columns()
+    fallback: Path | None = None
+    for image_path in result["image_path"]:
+        candidate = Path(str(image_path)).parents[2] / "TRACK_INFO" / "AI_RACING_LINE.csv"
+        if candidate.exists():
+            fallback = candidate
+            break
+    if fallback is None:
+        raise FileNotFoundError("no AI_RACING_LINE.csv found for prepared sessions")
+    for _, group in result.groupby("session", sort=False):
+        candidate = (Path(str(group.iloc[0].image_path)).parents[2]
+                     / "TRACK_INFO" / "AI_RACING_LINE.csv")
+        line = pd.read_csv(candidate if candidate.exists() else fallback)
+        norm = line["normalized_position"].to_numpy(float)
+        dist = line["dist"].to_numpy(float)
+        xy = line[["x", "y"]].to_numpy(float)
+        length = float(dist[-1] + np.linalg.norm(xy[0] - xy[-1]))
+        current = np.interp(group["spline_position"].to_numpy(float) % 1.0, norm, dist)
+        for lookahead, (x_name, y_name) in zip(RACING_LINE_LOOKAHEADS_M, columns):
+            target_dist = (current + lookahead) % length
+            indices = np.minimum(np.searchsorted(dist, target_dist), len(xy) - 1)
+            result.loc[group.index, x_name] = xy[indices, 0]
+            result.loc[group.index, y_name] = xy[indices, 1]
+    # Preserve the old names as metadata aliases for analysis scripts.
+    result["target_world_x"] = result[columns[-1][0]]
+    result["target_world_y"] = result[columns[-1][1]]
+    return result
+
+
+def enrich_model_inputs(manifest: pd.DataFrame) -> pd.DataFrame:
+    manifest = add_temporal_ego_features(manifest)
+    return add_racing_line_targets(manifest)
+
+
+def write_schema(output: Path) -> None:
+    payload = {
+        "model_schema": model_schema_metadata(),
+        "normalization": normalization_metadata(),
+    }
+    (output / "schema.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def build_manifest(sessions: list[Path]) -> tuple[pd.DataFrame, list[dict[str, object]]]:
@@ -229,6 +292,7 @@ def prepare(dataset_v2: Path, output: Path, rgb_stride: int = 40) -> dict[str, o
     sessions = discover_sessions(dataset_v2)
     manifest, session_summary = build_manifest(sessions)
     manifest = add_training_eligibility(manifest, DEFAULT_FUTURE_OFFSETS)
+    manifest = enrich_model_inputs(manifest)
     manifest.to_parquet(output / "manifest.parquet", index=False)
     qc = sample_rgb_qc(manifest, max(1, rgb_stride))
     qc.to_parquet(output / "rgb_qc_samples.parquet", index=False)
@@ -245,6 +309,7 @@ def prepare(dataset_v2: Path, output: Path, rgb_stride: int = 40) -> dict[str, o
     }
     (output / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_schema(output)
     return summary
 
 
@@ -261,6 +326,8 @@ def prepare_from_manifest(source: Path, output: Path) -> dict[str, object]:
     if manifest.empty:
         raise RuntimeError("filtered manifest is empty")
     manifest["lap_phase"] = np.where(manifest["lap"] == 1, "standing", "flying")
+    manifest = add_training_eligibility(manifest, DEFAULT_FUTURE_OFFSETS)
+    manifest = enrich_model_inputs(manifest)
     manifest.to_parquet(output / "manifest.parquet", index=False)
 
     names = sorted(manifest["session"].unique())
@@ -289,6 +356,7 @@ def prepare_from_manifest(source: Path, output: Path) -> dict[str, object]:
     }
     (output / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_schema(output)
     return summary
 
 

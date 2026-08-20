@@ -2,6 +2,7 @@
 dataset/
 dataset_v2/
 training/
+tools/vjoy_installer/*.exe
 
 # 파이썬 캐시
 __pycache__/

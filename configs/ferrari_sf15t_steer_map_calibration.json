@@ -1,0 +1,17 @@
+{
+  "date": "2026-08-11",
+  "car": "ferrari_sf15t",
+  "source_map": "ferrari_sf15t_steer_map_reference.csv",
+  "telemetry_source": "steerNorm",
+  "positive_test": {
+    "vjoy_action": 0.3603515625,
+    "observed_steer_norm": 0.9009999632835388
+  },
+  "negative_test": {
+    "vjoy_action": -0.3603515625,
+    "observed_steer_norm": -0.9009999632835388
+  },
+  "observed_steer_norm_per_vjoy_action": 2.5003359414697663,
+  "calibrated_vjoy_action_at_steer_norm_1": 0.3999462565866939,
+  "physical_lock_deg": 180.0
+}

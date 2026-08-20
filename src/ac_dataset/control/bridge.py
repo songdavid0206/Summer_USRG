@@ -65,6 +65,8 @@ def main() -> None:
                 payload, address = sock.recvfrom(4096)
             except socket.timeout:
                 continue
+            received_ns = time.perf_counter_ns()
+            applied_ns = None
             try:
                 message = json.loads(payload.decode())
                 if message.get("token") != args.arm_token:
@@ -85,7 +87,8 @@ def main() -> None:
                     throttle = _clamp(message["throttle"], 0.0, 1.0)
                     brake = _clamp(message["brake"], 0.0, 1.0)
                     device.set_controls(steer, throttle, brake)
-                    last_command = now
+                    applied_ns = time.perf_counter_ns()
+                    last_command = applied_ns / 1e9
                 elif kind == "disarm":
                     if incoming_session == session and not emergency:
                         armed, reason, session = False, "disarmed", None
@@ -99,6 +102,8 @@ def main() -> None:
             except Exception as exc:
                 response = {"ok": False, "armed": armed, "emergency": emergency,
                             "reason": reason, "error": str(exc)}
+            response["bridge_received_perf_ns"] = received_ns
+            response["bridge_applied_perf_ns"] = applied_ns
             sock.sendto(json.dumps(response).encode(), address)
     except KeyboardInterrupt:
         print("[bridge] Ctrl+C; neutralizing and closing")
